@@ -16,7 +16,7 @@
     "chartjs-node-canvas": "^4.1.6",
     "chart.js": "^4.4.3",
     "qrcode": "^1.5.3",
-    "bwip-js": "^3.5.0",
+    "bwip-js": "^3.4.2",
     "mathjs": "^13.0.0",
     "satori": "^0.10.13",
     "sharp": "^0.33.4"
