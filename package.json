@@ -1,6 +1,6 @@
 {
   "name": "nexa-tools-api",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "engines": { "node": "20.x" },
@@ -19,6 +19,8 @@
     "bwip-js": "^3.4.2",
     "mathjs": "^13.0.0",
     "satori": "^0.10.13",
-    "sharp": "^0.33.4"
+    "sharp": "^0.33.4",
+    "adm-zip": "^0.5.15",
+    "pdf-parse": "^1.1.1"
   }
 }

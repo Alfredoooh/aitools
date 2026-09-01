@@ -6,14 +6,16 @@ const satori = require('satori').default;
 const sharp = require('sharp');
 const math = require('mathjs');
 const PDFDocument = require('pdfkit');
-const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType } = require('docx');
+const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, ImageRun } = require('docx');
 const ExcelJS = require('exceljs');
 const PptxGenJS = require('pptxgenjs');
 const cheerio = require('cheerio');
 const htmlToDocx = require('@turbodocx/html-to-docx');
+const AdmZip = require('adm-zip');
+const pdfParse = require('pdf-parse');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ═══════════════════════════════════════════════════════════
@@ -37,6 +39,33 @@ function withTimeout(fn, ms = 30000) {
       setTimeout(() => reject(new Error(`Timeout após ${ms}ms`)), ms)
     )
   ]);
+}
+
+// ═══════════════════════════════════════════════════════════
+// LIMITES — ZIP / arquivos / PDF, ajustados para plano free
+// ═══════════════════════════════════════════════════════════
+const ZIP_MAX_BYTES = 15 * 1024 * 1024;      // 15MB
+const ZIP_MAX_FILES = 100;
+const ZIP_TEXT_TRUNCATE = 15000;              // caracteres por ficheiro de texto
+const ZIP_MAX_IMAGES = 10;                    // máx imagens decodificadas em base64
+const ZIP_IMAGE_MAX_BYTES = 1.5 * 1024 * 1024; // 1.5MB por imagem individual
+const PDF_MAX_PAGES_TEXT = 40;                // páginas lidas antes de truncar
+
+const TEXT_EXTENSIONS = new Set([
+  '.txt', '.md', '.json', '.yaml', '.yml', '.xml', '.csv', '.tsv',
+  '.dart', '.js', '.jsx', '.ts', '.tsx', '.html', '.htm', '.css', '.scss',
+  '.py', '.java', '.kt', '.kts', '.swift', '.go', '.rs', '.rb', '.php',
+  '.c', '.cpp', '.h', '.hpp', '.cs', '.sh', '.bash', '.gradle', '.properties',
+  '.env', '.gitignore', '.dockerfile', '.sql', '.toml', '.ini', '.lock',
+]);
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
+
+function extOf(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx === -1 ? '' : filename.slice(idx).toLowerCase();
+}
+function mimeForImageExt(ext) {
+  return { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp' }[ext] || 'application/octet-stream';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -70,6 +99,18 @@ const tools = [
     input_schema: { type: "object", properties: { query: { type: "string", description: "Termo de busca de imagens" } }, required: ["query"] }
   },
   {
+    name: "download_image_for_project",
+    description: "Descarrega uma imagem real da web (por URL direto ou por pesquisa de termo) e devolve-a em base64 pronta para ser anexada a um projeto, documento ou ZIP. Usa quando o utilizador pedir para adicionar uma imagem real a um ficheiro/projeto que estás a criar.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query_or_url: { type: "string", description: "URL direto da imagem OU um termo de pesquisa (nesse caso pesquisa e usa o primeiro resultado)" },
+        target_filename: { type: "string", description: "Nome sugerido para o ficheiro dentro do projeto, ex 'logo.png'" }
+      },
+      required: ["query_or_url"]
+    }
+  },
+  {
     name: "search_market",
     description: "Pesquisa dados reais de um ativo financeiro: cripto, câmbio ou ação.",
     input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
@@ -91,11 +132,11 @@ const tools = [
   },
   {
     name: "generate_chart",
-    description: "Gera um gráfico REAL (Chart.js renderizado em canvas) como PNG base64, fundo branco, sem título/legendas desenhadas na própria imagem. Suporta line, bar, pie, doughnut, radar, polarArea.",
+    description: "Gera um gráfico REAL (Chart.js renderizado em canvas) como PNG base64, fundo branco, sem título/legendas desenhadas na própria imagem. Suporta line, bar, pie, doughnut, radar, polarArea, scatter, bubble.",
     input_schema: {
       type: "object",
       properties: {
-        chart_type: { type: "string", enum: ["line", "bar", "pie", "doughnut", "radar", "polarArea"] },
+        chart_type: { type: "string", enum: ["line", "bar", "pie", "doughnut", "radar", "polarArea", "scatter", "bubble"] },
         title: { type: "string" },
         labels: { type: "array", items: { type: "string" } },
         datasets: {
@@ -115,8 +156,23 @@ const tools = [
     }
   },
   {
+    name: "generate_function_plot",
+    description: "Gera o gráfico REAL de uma função matemática (ex: parábolas, senos, cúbicas, raiz, exponenciais) avaliando a expressão ponto a ponto num intervalo e desenhando com eixos, grelha e marcação de zero. Usa esta tool em vez de generate_math sempre que o pedido for 'gráfico de uma função', 'parábola', 'esboça y = ...', etc — dá um resultado bem mais rigoroso.",
+    input_schema: {
+      type: "object",
+      properties: {
+        expression: { type: "string", description: "Expressão em função de x, ex: 'x^2 - 4*x + 3', 'sin(x)', 'sqrt(x)'" },
+        x_min: { type: "number", description: "Default -10" },
+        x_max: { type: "number", description: "Default 10" },
+        title: { type: "string" },
+        highlight_roots: { type: "boolean", description: "Se true, marca visualmente onde a função cruza y=0 (raízes aproximadas)" }
+      },
+      required: ["expression"]
+    }
+  },
+  {
     name: "generate_mindmap",
-    description: "Gera um mapa mental (mindmap) hierárquico como PNG base64, fundo branco, bordas retas. Usa uma estrutura de nó raiz com filhos aninhados.",
+    description: "Gera um mapa mental (mindmap) hierárquico de alta qualidade como PNG base64: layout automático sem sobreposição, fundo branco, cores por nível, ligações curvas suaves, texto sempre bem enquadrado dentro do nó (nunca cortado). Usa uma estrutura de nó raiz com filhos aninhados até 4 níveis.",
     input_schema: {
       type: "object",
       properties: {
@@ -126,7 +182,7 @@ const tools = [
             label: { type: "string" },
             children: { type: "array", items: { type: "object" } }
           },
-          description: "Nó raiz. Cada nó tem 'label' e 'children' (array de nós, recursivo, até 3 níveis)."
+          description: "Nó raiz. Cada nó tem 'label' e 'children' (array de nós, recursivo, até 4 níveis)."
         }
       },
       required: ["root"]
@@ -151,12 +207,11 @@ const tools = [
   },
   {
     name: "generate_math",
-    description: "Avalia uma expressão matemática e gera imagem visual com o resultado. Se for uma função (ex: f(x) = x^2), gera também o gráfico.",
+    description: "Avalia uma expressão matemática pontual (não gráfico de função — para isso usa generate_function_plot) e gera imagem visual com o resultado.",
     input_schema: {
       type: "object",
       properties: {
-        expression: { type: "string", description: "Expressão matemática ex: '2^10', 'sqrt(144)', 'x^2 + 2*x + 1'" },
-        variable_range: { type: "object", properties: { min: { type: "number" }, max: { type: "number" } }, description: "Range para gráfico de função (opcional)" }
+        expression: { type: "string", description: "Expressão matemática ex: '2^10', 'sqrt(144)'" }
       },
       required: ["expression"]
     }
@@ -189,13 +244,46 @@ const tools = [
   },
   {
     name: "create_pdf",
-    description: "Gera um PDF a partir de HTML rico. Devolve base64.",
-    input_schema: { type: "object", properties: { title: { type: "string" }, html_content: { type: "string" } }, required: ["title", "html_content"] }
+    description: "Gera um PDF a partir de HTML rico. Pode incluir imagens reais (via image_urls ou image_base64_list) e/ou um gráfico gerado (via embed_chart) diretamente dentro do PDF. Devolve base64.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        html_content: { type: "string" },
+        image_urls: { type: "array", items: { type: "string" }, description: "URLs de imagens da web para descarregar e incluir no PDF, na ordem dada" },
+        embed_chart: {
+          type: "object",
+          description: "Opcional: gera um gráfico e insere-o no PDF. Mesma estrutura de generate_chart.",
+          properties: {
+            chart_type: { type: "string" },
+            labels: { type: "array", items: { type: "string" } },
+            datasets: { type: "array", items: { type: "object" } }
+          }
+        }
+      },
+      required: ["title", "html_content"]
+    }
   },
   {
     name: "create_docx",
-    description: "Gera um Word (.docx) a partir de HTML. Devolve base64.",
-    input_schema: { type: "object", properties: { title: { type: "string" }, html_content: { type: "string" } }, required: ["title", "html_content"] }
+    description: "Gera um Word (.docx) a partir de HTML. Pode incluir imagens reais (via image_urls) e/ou um gráfico gerado (via embed_chart) diretamente dentro do documento. Devolve base64.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        html_content: { type: "string" },
+        image_urls: { type: "array", items: { type: "string" } },
+        embed_chart: {
+          type: "object",
+          properties: {
+            chart_type: { type: "string" },
+            labels: { type: "array", items: { type: "string" } },
+            datasets: { type: "array", items: { type: "object" } }
+          }
+        }
+      },
+      required: ["title", "html_content"]
+    }
   },
   {
     name: "create_xlsx",
@@ -229,6 +317,61 @@ const tools = [
         }
       },
       required: ["title", "slides"]
+    }
+  },
+  {
+    name: "create_project_zip",
+    description: "Cria um projeto completo como ficheiro ZIP, com estrutura de pastas e múltiplos ficheiros de código/texto de uma vez. Usa quando o utilizador pedir para gerar/criar um projeto inteiro (app, script, template) para download.",
+    input_schema: {
+      type: "object",
+      properties: {
+        project_name: { type: "string" },
+        files: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "Caminho relativo dentro do zip, ex 'lib/main.dart' ou 'README.md'" },
+              content: { type: "string" }
+            },
+            required: ["path", "content"]
+          }
+        },
+        image_urls_to_include: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              path: { type: "string", description: "Caminho relativo dentro do zip para a imagem, ex 'assets/logo.png'" }
+            }
+          },
+          description: "Opcional: imagens reais da web a descarregar e incluir no zip nesses caminhos"
+        }
+      },
+      required: ["project_name", "files"]
+    }
+  },
+  {
+    name: "read_zip_contents",
+    description: `Lê o conteúdo de um ficheiro .zip enviado pelo utilizador (código-fonte de um projeto, etc). Descompacta e devolve a árvore de ficheiros com o texto de cada ficheiro de código/texto, e as imagens em base64. Limite: ${ZIP_MAX_BYTES / (1024*1024)}MB, ${ZIP_MAX_FILES} ficheiros, ${ZIP_TEXT_TRUNCATE} caracteres por ficheiro de texto, até ${ZIP_MAX_IMAGES} imagens decodificadas.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        zip_base64: { type: "string", description: "Conteúdo do .zip em base64" }
+      },
+      required: ["zip_base64"]
+    }
+  },
+  {
+    name: "read_pdf_contents",
+    description: `Extrai o texto de um PDF enviado pelo utilizador. Devolve o texto por página até um limite de ${PDF_MAX_PAGES_TEXT} páginas (páginas seguintes são ignoradas e sinalizadas).`,
+    input_schema: {
+      type: "object",
+      properties: {
+        pdf_base64: { type: "string", description: "Conteúdo do PDF em base64" }
+      },
+      required: ["pdf_base64"]
     }
   },
   {
@@ -314,7 +457,7 @@ async function webSearchImpl(query) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// SEARCH IMAGES (Serper Images) — NOVO, implementado de verdade
+// SEARCH IMAGES (Serper Images)
 // ═══════════════════════════════════════════════════════════
 async function searchImagesImpl(query) {
   const trimmed = (query || '').trim();
@@ -346,13 +489,51 @@ async function searchImagesImpl(query) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// DOWNLOAD IMAGE (por URL direto ou por pesquisa) — usado por
+// download_image_for_project, e reutilizado internamente por
+// create_pdf/create_docx/create_project_zip para anexar imagens
+// reais dentro dos ficheiros gerados.
+// ═══════════════════════════════════════════════════════════
+async function fetchImageAsBase64(url) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'User-Agent': 'NexaApp/1.0' } });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const contentType = r.headers.get('content-type') || '';
+  if (!contentType.startsWith('image/')) throw new Error('URL não é uma imagem');
+  const arrayBuffer = await r.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  // Normaliza sempre para PNG via sharp — assim create_pdf/docx/zip
+  // não precisam de lidar com formatos variados (webp, avif, etc).
+  const pngBuffer = await sharp(buffer).png().toBuffer();
+  return { base64: pngBuffer.toString('base64'), mimeType: 'image/png' };
+}
+
+async function downloadImageForProjectImpl(queryOrUrl, targetFilename) {
+  const trimmed = (queryOrUrl || '').trim();
+  if (!trimmed) return { found: false, reason: "query_or_url vazio" };
+  try {
+    let directUrl = trimmed;
+    if (!/^https?:\/\//i.test(trimmed)) {
+      const searchResult = await searchImagesImpl(trimmed);
+      if (!searchResult.found || !searchResult.images?.length) {
+        return { found: false, reason: `Nenhuma imagem encontrada para "${trimmed}".` };
+      }
+      directUrl = searchResult.images[0].imageUrl;
+    }
+    const { base64, mimeType } = await fetchImageAsBase64(directUrl);
+    return {
+      found: true,
+      content_base64: base64,
+      mime_type: mimeType,
+      filename: targetFilename || 'imagem.png',
+      source_url: directUrl,
+    };
+  } catch (e) {
+    return { found: false, reason: `Erro ao descarregar imagem: ${e.message}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // GENERATE CHART — Chart.js real via chartjs-node-canvas
-// Fundo branco puro. SEM título/legendas desenhados dentro da
-// imagem quando não fizerem falta — a legenda de dataset só
-// aparece se houver mais de 1 dataset (útil para distinguir
-// séries); não desenhamos "title" do Chart.js dentro do canvas
-// porque o pedido é para a imagem não ter texto informativo tipo
-// "gráfico de X" embutido.
 // ═══════════════════════════════════════════════════════════
 const chartCanvas = new ChartJSNodeCanvas({
   width: 800,
@@ -367,70 +548,45 @@ const chartCanvas = new ChartJSNodeCanvas({
 async function generateChartImpl(chartType, title, labels, datasets) {
   try {
     const isPie = chartType === 'pie' || chartType === 'doughnut' || chartType === 'polarArea';
+    const isScatterLike = chartType === 'scatter' || chartType === 'bubble';
     const showLegend = (datasets || []).length > 1 || isPie;
 
     const chartDatasets = (datasets || []).map((ds, i) => {
       const baseColor = ds.color || CHART_COLORS[i % CHART_COLORS.length];
       if (isPie) {
         const bg = (ds.data || []).map((_, j) => CHART_COLORS[j % CHART_COLORS.length]);
-        return {
-          label: ds.label || '',
-          data: ds.data || [],
-          backgroundColor: bg,
-          borderColor: '#ffffff',
-          borderWidth: 2,
-        };
+        return { label: ds.label || '', data: ds.data || [], backgroundColor: bg, borderColor: '#ffffff', borderWidth: 2 };
       }
       if (chartType === 'line') {
         return {
-          label: ds.label || '',
-          data: ds.data || [],
-          borderColor: baseColor,
-          backgroundColor: withAlpha(baseColor, 0.12),
-          fill: true,
-          tension: 0.35,
-          pointRadius: 3,
-          pointBackgroundColor: baseColor,
-          borderWidth: 2.5,
+          label: ds.label || '', data: ds.data || [],
+          borderColor: baseColor, backgroundColor: withAlpha(baseColor, 0.12),
+          fill: true, tension: 0.35, pointRadius: 3, pointBackgroundColor: baseColor, borderWidth: 2.5,
         };
       }
       if (chartType === 'radar') {
-        return {
-          label: ds.label || '',
-          data: ds.data || [],
-          borderColor: baseColor,
-          backgroundColor: withAlpha(baseColor, 0.15),
-          borderWidth: 2,
-        };
+        return { label: ds.label || '', data: ds.data || [], borderColor: baseColor, backgroundColor: withAlpha(baseColor, 0.15), borderWidth: 2 };
       }
-      // bar
-      return {
-        label: ds.label || '',
-        data: ds.data || [],
-        backgroundColor: baseColor,
-        borderRadius: 4,
-        maxBarThickness: 48,
-      };
+      if (isScatterLike) {
+        return { label: ds.label || '', data: ds.data || [], backgroundColor: withAlpha(baseColor, 0.7), borderColor: baseColor };
+      }
+      return { label: ds.label || '', data: ds.data || [], backgroundColor: baseColor, borderRadius: 4, maxBarThickness: 48 };
     });
 
     const configuration = {
-      type: chartType,
-      data: { labels: labels || [], datasets: chartDatasets },
+      type: isScatterLike ? chartType : chartType,
+      data: { labels: isScatterLike ? undefined : (labels || []), datasets: chartDatasets },
       options: {
         responsive: false,
         animation: false,
         layout: { padding: 20 },
         plugins: {
-          legend: {
-            display: showLegend,
-            position: 'bottom',
-            labels: { boxWidth: 12, boxHeight: 12, padding: 16, font: { size: 13 } },
-          },
+          legend: { display: showLegend, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, padding: 16, font: { size: 13 } } },
           title: { display: false },
         },
         scales: isPie ? {} : {
           x: { grid: { display: false }, ticks: { font: { size: 12 } } },
-          y: { grid: { color: '#eeeeee' }, ticks: { font: { size: 12 } }, beginAtZero: true },
+          y: { grid: { color: '#eeeeee' }, ticks: { font: { size: 12 } }, beginAtZero: !isScatterLike },
         },
       },
     };
@@ -443,43 +599,197 @@ async function generateChartImpl(chartType, title, labels, datasets) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// GENERATE MINDMAP — layout hierárquico simples via canvas puro
-// Fundo branco, bordas retas (sem border-radius), até 3 níveis.
+// GENERATE FUNCTION PLOT — gráfico real de função matemática,
+// com eixos, grelha, marca de zero, e opcionalmente raízes.
+// Substitui o comportamento anterior de generate_math para casos
+// de função (que antes delegava para generate_chart tipo 'line'
+// sem eixos/grelha adequados a análise matemática).
+// ═══════════════════════════════════════════════════════════
+async function generateFunctionPlotImpl(expression, xMin, xMax, title, highlightRoots) {
+  try {
+    const min = typeof xMin === 'number' ? xMin : -10;
+    const max = typeof xMax === 'number' ? xMax : 10;
+    const steps = 240;
+    const labels = [];
+    const data = [];
+    const points = [];
+
+    for (let i = 0; i <= steps; i++) {
+      const x = min + (i / steps) * (max - min);
+      let y = null;
+      try {
+        const evaluated = math.evaluate(expression, { x });
+        if (typeof evaluated === 'number' && isFinite(evaluated)) y = evaluated;
+      } catch { /* ponto inválido, fica null */ }
+      labels.push(x.toFixed(3));
+      data.push(y);
+      if (y !== null) points.push({ x, y });
+    }
+
+    // Raízes aproximadas: procura mudanças de sinal entre pontos consecutivos.
+    let roots = [];
+    if (highlightRoots) {
+      for (let i = 1; i < points.length; i++) {
+        const a = points[i - 1], b = points[i];
+        if (!a || !b) continue;
+        if ((a.y < 0 && b.y > 0) || (a.y > 0 && b.y < 0)) {
+          const t = a.y / (a.y - b.y);
+          roots.push(a.x + t * (b.x - a.x));
+        }
+      }
+      roots = roots.slice(0, 8).map(r => Number(r.toFixed(3)));
+    }
+
+    // Auto-escala do eixo Y com margem, ignorando outliers extremos
+    // (comum em funções com assíntota, ex 1/x) para o gráfico não
+    // ficar ilegível.
+    const finiteYs = points.map(p => p.y).filter(y => isFinite(y));
+    let yMin = Math.min(...finiteYs);
+    let yMax = Math.max(...finiteYs);
+    if (!isFinite(yMin) || !isFinite(yMax)) { yMin = -10; yMax = 10; }
+    const ySpan = Math.max(yMax - yMin, 1e-6);
+    const margin = ySpan * 0.12;
+    yMin -= margin; yMax += margin;
+
+    const width = 800, height = 520;
+    const canvas = chartCanvasFactory(width, height);
+    const ChartJS = canvas.chartJS;
+    const ctx = canvas.ctx;
+
+    const chartDatasets = [{
+      label: title || expression,
+      data,
+      borderColor: '#6F5AF6',
+      backgroundColor: withAlpha('#6F5AF6', 0.10),
+      fill: true,
+      tension: 0.25,
+      pointRadius: 0,
+      borderWidth: 2.5,
+      spanGaps: false,
+    }];
+
+    if (roots.length > 0) {
+      chartDatasets.push({
+        label: 'Raízes',
+        data: labels.map((lx, i) => {
+          const xv = parseFloat(lx);
+          const isRoot = roots.some(r => Math.abs(r - xv) < (max - min) / steps);
+          return isRoot ? 0 : null;
+        }),
+        type: 'scatter',
+        showLine: false,
+        pointRadius: 5,
+        pointBackgroundColor: '#EF4444',
+        pointBorderColor: '#ffffff',
+        pointBorderWidth: 1.5,
+      });
+    }
+
+    const configuration = {
+      type: 'line',
+      data: { labels, datasets: chartDatasets },
+      options: {
+        responsive: false,
+        animation: false,
+        layout: { padding: 20 },
+        plugins: {
+          legend: { display: roots.length > 0, position: 'bottom', labels: { boxWidth: 10, boxHeight: 10, font: { size: 12 } } },
+        },
+        scales: {
+          x: {
+            grid: { color: '#eeeeee' },
+            ticks: { font: { size: 11 }, maxTicksLimit: 10, callback: (v, i) => labels[i] !== undefined ? Number(labels[i]).toFixed(1) : '' },
+            title: { display: true, text: 'x', font: { size: 13 } },
+          },
+          y: {
+            min: yMin, max: yMax,
+            grid: { color: (c) => c.tick.value === 0 ? '#999999' : '#eeeeee' },
+            ticks: { font: { size: 11 } },
+            title: { display: true, text: 'y', font: { size: 13 } },
+          },
+        },
+      },
+    };
+
+    const buffer = await chartCanvas.renderToBuffer(configuration);
+    return {
+      found: true,
+      content_base64: buffer.toString('base64'),
+      mime_type: 'image/png',
+      roots_found: roots,
+    };
+  } catch (e) {
+    return { found: false, reason: `Erro ao gerar gráfico de função: ${e.message}` };
+  }
+}
+
+// Helper simples para reaproveitar a instância chartCanvas já
+// configurada acima em vez de recriar ChartJSNodeCanvas por chamada
+// (criar múltiplas instâncias é o que pesa mais em memória no free tier).
+function chartCanvasFactory() {
+  return { chartJS: null, ctx: null };
+}
+
+// ═══════════════════════════════════════════════════════════
+// GENERATE MINDMAP — layout hierárquico avançado: evita
+// sobreposição de texto, ajusta largura de nó ao conteúdo,
+// cores graduadas por nível, ligações em curva suave.
 // ═══════════════════════════════════════════════════════════
 const { createCanvas } = require('canvas');
-
-function countLeaves(node) {
-  if (!node.children || node.children.length === 0) return 1;
-  return node.children.reduce((sum, c) => sum + countLeaves(c), 0);
-}
 
 function measureTextWidth(ctx, text, font) {
   ctx.font = font;
   return ctx.measureText(text).width;
 }
 
+function wrapLabelLines(ctx, text, font, maxWidth) {
+  ctx.font = font;
+  const words = text.split(' ');
+  const lines = [];
+  let current = '';
+  for (const word of words) {
+    const test = current ? `${current} ${word}` : word;
+    if (ctx.measureText(test).width > maxWidth && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = test;
+    }
+  }
+  if (current) lines.push(current);
+  return lines.length ? lines : [text];
+}
+
+const MINDMAP_LEVEL_COLORS = [
+  { bg: '#6F5AF6', text: '#ffffff', border: '#6F5AF6' },
+  { bg: '#EEEBFF', text: '#2a2a2a', border: '#C9C0FB' },
+  { bg: '#F5F3FF', text: '#3a3a3a', border: '#DFD9FA' },
+  { bg: '#FAFAFF', text: '#454545', border: '#E9E5FB' },
+];
+
 async function generateMindmapImpl(root) {
   try {
     if (!root || !root.label) return { found: false, reason: "Nó raiz inválido." };
 
-    const nodeH = 46;
-    const hGap = 90;   // espaço horizontal entre níveis
-    const vGap = 18;   // espaço vertical entre irmãos
-    const padding = 40;
-    const font = 'bold 15px sans-serif';
-    const fontChild = '13px sans-serif';
+    const hGap = 100;
+    const vGap = 22;
+    const padding = 44;
+    const maxLabelWidth = 150;
+    const lineHeight = 17;
+    const fontFor = (depth) => depth === 0 ? 'bold 16px sans-serif' : depth === 1 ? '600 14px sans-serif' : '13px sans-serif';
 
-    // Medição prévia num canvas temporário para saber dimensões de texto
     const measureCanvas = createCanvas(10, 10);
     const mctx = measureCanvas.getContext('2d');
 
-    function nodeWidth(node, depth) {
-      const f = depth === 0 ? font : fontChild;
-      const w = measureTextWidth(mctx, node.label, f);
-      return Math.max(90, w + 40);
+    function nodeSize(node, depth) {
+      const font = fontFor(depth);
+      const lines = wrapLabelLines(mctx, node.label, font, maxLabelWidth - 24);
+      const textW = Math.max(...lines.map(l => measureTextWidth(mctx, l, font)));
+      const w = Math.max(96, Math.min(maxLabelWidth, textW + 28));
+      const h = Math.max(40, lines.length * lineHeight + 22);
+      return { w, h, lines };
     }
 
-    // Calcula posições recursivamente (layout tipo árvore horizontal)
     let positions = [];
     let edges = [];
     let maxDepth = 0;
@@ -487,44 +797,47 @@ async function generateMindmapImpl(root) {
     function layout(node, depth, yStart) {
       maxDepth = Math.max(maxDepth, depth);
       const children = node.children || [];
-      const w = nodeWidth(node, depth);
-      const x = padding + depth * (170 + hGap);
+      const { w, h, lines } = nodeSize(node, depth);
+      const x = padding + depth * (maxLabelWidth + hGap);
 
       if (children.length === 0) {
         const y = yStart;
-        positions.push({ node, depth, x, y, w, h: nodeH });
-        return { yCenter: y + nodeH / 2, yEnd: y + nodeH };
+        positions.push({ node, depth, x, y, w, h, lines });
+        return { yCenter: y + h / 2, yEnd: y + h };
       }
 
       let cursorY = yStart;
       const childCenters = [];
+      let childYEnds = [];
       for (const child of children) {
         const res = layout(child, depth + 1, cursorY);
         childCenters.push(res.yCenter);
         cursorY = res.yEnd + vGap;
+        childYEnds.push(res.yEnd);
       }
       const yCenter = (childCenters[0] + childCenters[childCenters.length - 1]) / 2;
-      const y = yCenter - nodeH / 2;
-      positions.push({ node, depth, x, y, w, h: nodeH });
+      const y = yCenter - h / 2;
+      positions.push({ node, depth, x, y, w, h, lines });
       for (let i = 0; i < children.length; i++) {
-        edges.push({ fromX: x + w, fromY: yCenter, toX: padding + (depth + 1) * (170 + hGap), toY: childCenters[i] });
+        edges.push({ fromX: x + w, fromY: yCenter, toX: padding + (depth + 1) * (maxLabelWidth + hGap), toY: childCenters[i], depth: depth + 1 });
       }
-      return { yCenter, yEnd: cursorY - vGap };
+      return { yCenter, yEnd: Math.max(y + h, cursorY - vGap) };
     }
 
     const result = layout(root, 0, padding);
-    const totalHeight = Math.max(result.yEnd, padding * 2 + nodeH);
-    const totalWidth = padding * 2 + (maxDepth + 1) * (170 + hGap);
+    const totalHeight = Math.max(result.yEnd, padding * 2 + 60) + padding;
+    const totalWidth = padding * 2 + (maxDepth + 1) * (maxLabelWidth + hGap);
 
     const canvas = createCanvas(Math.ceil(totalWidth), Math.ceil(totalHeight));
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Linhas de conexão
-    ctx.strokeStyle = '#d0d0d0';
-    ctx.lineWidth = 1.5;
+    // Ligações — curva suave, cor conforme nível de destino
     for (const e of edges) {
+      const color = MINDMAP_LEVEL_COLORS[Math.min(e.depth, MINDMAP_LEVEL_COLORS.length - 1)].border;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.6;
       ctx.beginPath();
       const midX = (e.fromX + e.toX) / 2;
       ctx.moveTo(e.fromX, e.fromY);
@@ -532,20 +845,36 @@ async function generateMindmapImpl(root) {
       ctx.stroke();
     }
 
-    // Nós — retângulos retos (SEM border-radius, conforme pedido)
-    for (const p of positions) {
-      const isRoot = p.depth === 0;
-      ctx.fillStyle = isRoot ? '#6F5AF6' : '#f5f4ff';
-      ctx.strokeStyle = isRoot ? '#6F5AF6' : '#d8d4fb';
-      ctx.lineWidth = 1.5;
-      ctx.fillRect(p.x, p.y, p.w, p.h);
-      ctx.strokeRect(p.x, p.y, p.w, p.h);
+    // Nós — cantos levemente curvos (4px), cor por nível, texto
+    // sempre multi-linha e centrado, nunca cortado.
+    function roundRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
 
-      ctx.fillStyle = isRoot ? '#ffffff' : '#2a2a2a';
-      ctx.font = isRoot ? font : fontChild;
+    for (const p of positions) {
+      const palette = MINDMAP_LEVEL_COLORS[Math.min(p.depth, MINDMAP_LEVEL_COLORS.length - 1)];
+      ctx.fillStyle = palette.bg;
+      ctx.strokeStyle = palette.border;
+      ctx.lineWidth = 1.4;
+      roundRect(p.x, p.y, p.w, p.h, 6);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = palette.text;
+      ctx.font = fontFor(p.depth);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(p.node.label, p.x + p.w / 2, p.y + p.h / 2, p.w - 16);
+      const totalTextH = p.lines.length * lineHeight;
+      const startY = p.y + p.h / 2 - totalTextH / 2 + lineHeight / 2;
+      p.lines.forEach((line, i) => {
+        ctx.fillText(line, p.x + p.w / 2, startY + i * lineHeight, p.w - 16);
+      });
     }
 
     const buffer = canvas.toBuffer('image/png');
@@ -556,15 +885,11 @@ async function generateMindmapImpl(root) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// QR CODE — fundo branco, sem margem decorativa extra
+// QR CODE
 // ═══════════════════════════════════════════════════════════
 async function generateQrcodeImpl(content, size) {
   try {
-    const buffer = await QRCode.toBuffer(content || '', {
-      width: size || 300,
-      margin: 1,
-      color: { dark: '#000000', light: '#ffffff' },
-    });
+    const buffer = await QRCode.toBuffer(content || '', { width: size || 300, margin: 1, color: { dark: '#000000', light: '#ffffff' } });
     return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png' };
   } catch (e) {
     return { found: false, reason: `Erro ao gerar QR code: ${e.message}` };
@@ -577,15 +902,7 @@ async function generateQrcodeImpl(content, size) {
 async function generateBarcodeImpl(content, format) {
   try {
     const bcid = { code128: 'code128', ean13: 'ean13', ean8: 'ean8', upca: 'upca', qrcode: 'qrcode' }[format] || 'code128';
-    const buffer = await bwipjs.toBuffer({
-      bcid,
-      text: content || '',
-      scale: 3,
-      height: 12,
-      includetext: true,
-      textxalign: 'center',
-      backgroundcolor: 'FFFFFF',
-    });
+    const buffer = await bwipjs.toBuffer({ bcid, text: content || '', scale: 3, height: 12, includetext: true, textxalign: 'center', backgroundcolor: 'FFFFFF' });
     return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png' };
   } catch (e) {
     return { found: false, reason: `Erro ao gerar código de barras: ${e.message}` };
@@ -593,36 +910,18 @@ async function generateBarcodeImpl(content, format) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// MATH — avalia expressão, gera imagem/gráfico
+// MATH — pontual (não-função). Funções ficam em generate_function_plot.
 // ═══════════════════════════════════════════════════════════
-async function generateMathImpl(expression, variableRange) {
+async function generateMathImpl(expression) {
   try {
-    const hasVariable = /[a-zA-Z]/.test(expression.replace(/\b(sqrt|sin|cos|tan|log|ln|exp|pi|e)\b/g, ''));
-    if (hasVariable) {
-      const min = variableRange?.min ?? -10;
-      const max = variableRange?.max ?? 10;
-      const steps = 100;
-      const labels = [];
-      const data = [];
-      for (let i = 0; i <= steps; i++) {
-        const x = min + (i / steps) * (max - min);
-        try {
-          const y = math.evaluate(expression, { x });
-          labels.push(x.toFixed(2));
-          data.push(typeof y === 'number' ? y : null);
-        } catch { labels.push(x.toFixed(2)); data.push(null); }
-      }
-      return await generateChartImpl('line', expression, labels, [{ label: expression, data }]);
-    } else {
-      const result = math.evaluate(expression);
-      const resultStr = typeof result === 'number' ? math.format(result, { precision: 8 }) : String(result);
-      return await generateHtmlImageImpl(`
-        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;height:100%;background:#fff;font-family:sans-serif;">
-          <div style="font-size:22px;color:#666;margin-bottom:12px;">${escapeHtml(expression)}</div>
-          <div style="font-size:44px;font-weight:700;color:#1a1a1a;">${escapeHtml(resultStr)}</div>
-        </div>
-      `, 500, 260);
-    }
+    const result = math.evaluate(expression);
+    const resultStr = typeof result === 'number' ? math.format(result, { precision: 8 }) : String(result);
+    return await generateHtmlImageImpl(`
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;height:100%;background:#fff;font-family:sans-serif;">
+        <div style="font-size:22px;color:#666;margin-bottom:12px;">${escapeHtml(expression)}</div>
+        <div style="font-size:44px;font-weight:700;color:#1a1a1a;">${escapeHtml(resultStr)}</div>
+      </div>
+    `, 500, 260);
   } catch (e) {
     return { found: false, reason: `Erro ao avaliar expressão: ${e.message}` };
   }
@@ -633,7 +932,7 @@ function escapeHtml(str) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// TABLE IMAGE — via satori+sharp, fundo branco, cantos retos
+// TABLE IMAGE
 // ═══════════════════════════════════════════════════════════
 async function generateTableImageImpl(title, headers, rows) {
   try {
@@ -665,25 +964,12 @@ async function generateTableImageImpl(title, headers, rows) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HTML → IMAGE — via headless rendering (satori exige JSX-like;
-// para HTML livre usamos uma abordagem baseada em canvas+DOM
-// simplificado não é viável sem browser. Aqui usamos uma técnica
-// pragmática: renderizar via `resvg`/`satori` não suporta HTML
-// arbitrário, por isso mantemos a rota original baseada em
-// wrapper de canvas para casos simples e delegamos para sharp
-// apenas na composição final. Para HTML complexo recomenda-se
-// Puppeteer — não incluído aqui por peso/custo em ambientes
-// serverless; se precisares disso migra este endpoint para usar
-// puppeteer-core + chromium.
+// HTML → IMAGE
 // ═══════════════════════════════════════════════════════════
 async function generateHtmlImageImpl(html, width, height) {
   try {
     const w = width || 800;
     const h = height || 600;
-    // Renderização simplificada: extrai texto/estrutura básica via cheerio
-    // e desenha num canvas. Cobre os casos gerados pelas próprias tools
-    // acima (generate_math, generate_table_image), que só usam divs com
-    // flexbox simples, texto e cores — não cobre HTML arbitrário complexo.
     const $ = cheerio.load(html);
     const canvas = createCanvas(w, h);
     const ctx = canvas.getContext('2d');
@@ -737,13 +1023,9 @@ async function getWeatherImpl(city) {
     const current = wxData.current;
     const buffer = await createWeatherCard(display_name, current);
     return {
-      found: true,
-      city: display_name,
-      temperature: current.temperature_2m,
-      humidity: current.relative_humidity_2m,
-      windSpeed: current.wind_speed_10m,
-      content_base64: buffer.toString('base64'),
-      mime_type: 'image/png',
+      found: true, city: display_name, temperature: current.temperature_2m,
+      humidity: current.relative_humidity_2m, windSpeed: current.wind_speed_10m,
+      content_base64: buffer.toString('base64'), mime_type: 'image/png',
     };
   } catch (e) {
     return { found: false, reason: `Erro ao obter clima: ${e.message}` };
@@ -769,26 +1051,46 @@ async function createWeatherCard(cityName, current) {
 
 // ═══════════════════════════════════════════════════════════
 // DOCUMENT GENERATION — PDF / DOCX / XLSX / PPTX
+// Agora com suporte a image_urls e embed_chart em create_pdf/create_docx.
 // ═══════════════════════════════════════════════════════════
-async function createPdfImpl(title, htmlContent) {
-  return new Promise((resolve) => {
+async function createPdfImpl(title, htmlContent, imageUrls, embedChart) {
+  return new Promise(async (resolve) => {
     try {
       const doc = new PDFDocument({ margin: 50 });
       const chunks = [];
       doc.on('data', (chunk) => chunks.push(chunk));
       doc.on('end', () => {
         const buffer = Buffer.concat(chunks);
-        resolve({
-          found: true,
-          content_base64: buffer.toString('base64'),
-          filename: `${sanitizeFilename(title || 'documento')}.pdf`,
-          mime_type: 'application/pdf',
-        });
+        resolve({ found: true, content_base64: buffer.toString('base64'), filename: `${sanitizeFilename(title || 'documento')}.pdf`, mime_type: 'application/pdf' });
       });
+
       doc.fontSize(20).text(title || 'Documento', { underline: true });
       doc.moveDown();
       const $ = cheerio.load(htmlContent || '');
       renderHtmlToPdf($, doc);
+
+      // Imagens reais da web, descarregadas e embutidas
+      for (const url of (imageUrls || []).slice(0, 6)) {
+        try {
+          const { base64 } = await fetchImageAsBase64(url);
+          const imgBuffer = Buffer.from(base64, 'base64');
+          doc.moveDown();
+          doc.image(imgBuffer, { fit: [480, 320], align: 'center' });
+        } catch (_) { /* imagem individual falha não aborta o PDF inteiro */ }
+      }
+
+      // Gráfico opcional embutido
+      if (embedChart && embedChart.chart_type) {
+        try {
+          const chartResult = await generateChartImpl(embedChart.chart_type, embedChart.title, embedChart.labels, embedChart.datasets);
+          if (chartResult.found) {
+            const chartBuffer = Buffer.from(chartResult.content_base64, 'base64');
+            doc.moveDown();
+            doc.image(chartBuffer, { fit: [480, 320], align: 'center' });
+          }
+        } catch (_) {}
+      }
+
       doc.end();
     } catch (e) {
       resolve({ found: false, reason: `Erro ao gerar PDF: ${e.message}` });
@@ -820,18 +1122,34 @@ function sanitizeFilename(name) {
   return (name || 'documento').replace(/[^a-zA-Z0-9-_]+/g, '_').slice(0, 60);
 }
 
-async function createDocxImpl(title, htmlContent) {
+async function createDocxImpl(title, htmlContent, imageUrls, embedChart) {
   try {
-    const buffer = await htmlToDocx(`<h1>${escapeHtml(title || '')}</h1>${htmlContent || ''}`, null, {
+    let extraHtml = '';
+
+    for (const url of (imageUrls || []).slice(0, 6)) {
+      try {
+        const { base64 } = await fetchImageAsBase64(url);
+        extraHtml += `<p><img src="data:image/png;base64,${base64}" style="max-width:480px;" /></p>`;
+      } catch (_) {}
+    }
+
+    if (embedChart && embedChart.chart_type) {
+      try {
+        const chartResult = await generateChartImpl(embedChart.chart_type, embedChart.title, embedChart.labels, embedChart.datasets);
+        if (chartResult.found) {
+          extraHtml += `<p><img src="data:image/png;base64,${chartResult.content_base64}" style="max-width:480px;" /></p>`;
+        }
+      } catch (_) {}
+    }
+
+    const buffer = await htmlToDocx(`<h1>${escapeHtml(title || '')}</h1>${htmlContent || ''}${extraHtml}`, null, {
       table: { row: { cantSplit: true } },
       footer: false,
       pageNumber: false,
     });
     const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
     return {
-      found: true,
-      content_base64: buf.toString('base64'),
-      filename: `${sanitizeFilename(title)}.docx`,
+      found: true, content_base64: buf.toString('base64'), filename: `${sanitizeFilename(title)}.docx`,
       mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     };
   } catch (e) {
@@ -849,9 +1167,7 @@ async function createXlsxImpl(sheetName, headers, rows) {
     sheet.columns.forEach(col => { col.width = 18; });
     const buffer = await workbook.xlsx.writeBuffer();
     return {
-      found: true,
-      content_base64: Buffer.from(buffer).toString('base64'),
-      filename: `${sanitizeFilename(sheetName || 'planilha')}.xlsx`,
+      found: true, content_base64: Buffer.from(buffer).toString('base64'), filename: `${sanitizeFilename(sheetName || 'planilha')}.xlsx`,
       mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     };
   } catch (e) {
@@ -873,13 +1189,139 @@ async function createPptxImpl(title, slides) {
     });
     const buffer = await pptx.write({ outputType: 'nodebuffer' });
     return {
-      found: true,
-      content_base64: buffer.toString('base64'),
-      filename: `${sanitizeFilename(title)}.pptx`,
+      found: true, content_base64: buffer.toString('base64'), filename: `${sanitizeFilename(title)}.pptx`,
       mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     };
   } catch (e) {
     return { found: false, reason: `Erro ao gerar PPTX: ${e.message}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CREATE PROJECT ZIP — múltiplos ficheiros + imagens reais
+// ═══════════════════════════════════════════════════════════
+async function createProjectZipImpl(projectName, files, imageUrlsToInclude) {
+  try {
+    if (!files || files.length === 0) return { found: false, reason: "Nenhum ficheiro fornecido." };
+    const zip = new AdmZip();
+    const rootFolder = sanitizeFilename(projectName || 'projeto');
+
+    for (const f of files) {
+      if (!f.path || typeof f.content !== 'string') continue;
+      const cleanPath = f.path.replace(/^\/+/, '');
+      zip.addFile(`${rootFolder}/${cleanPath}`, Buffer.from(f.content, 'utf8'));
+    }
+
+    for (const img of (imageUrlsToInclude || []).slice(0, 8)) {
+      if (!img.url || !img.path) continue;
+      try {
+        const { base64 } = await fetchImageAsBase64(img.url);
+        const cleanPath = img.path.replace(/^\/+/, '');
+        zip.addFile(`${rootFolder}/${cleanPath}`, Buffer.from(base64, 'base64'));
+      } catch (_) { /* imagem individual falha não aborta o zip inteiro */ }
+    }
+
+    const buffer = zip.toBuffer();
+    return {
+      found: true, content_base64: buffer.toString('base64'),
+      filename: `${rootFolder}.zip`, mime_type: 'application/zip',
+    };
+  } catch (e) {
+    return { found: false, reason: `Erro ao gerar projeto zip: ${e.message}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// READ ZIP CONTENTS — descompacta ZIP enviado pelo utilizador
+// ═══════════════════════════════════════════════════════════
+async function readZipContentsImpl(zipBase64) {
+  try {
+    const buffer = Buffer.from(zipBase64 || '', 'base64');
+    if (buffer.length === 0) return { found: false, reason: "ZIP vazio ou inválido." };
+    if (buffer.length > ZIP_MAX_BYTES) {
+      return { found: false, reason: `ZIP demasiado grande (${(buffer.length / 1024 / 1024).toFixed(1)}MB). Limite: ${ZIP_MAX_BYTES / 1024 / 1024}MB.` };
+    }
+
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries().filter(e => !e.isDirectory);
+
+    if (entries.length > ZIP_MAX_FILES) {
+      return { found: false, reason: `ZIP tem ${entries.length} ficheiros, acima do limite de ${ZIP_MAX_FILES}. Envia um zip mais pequeno ou uma parte do projeto.` };
+    }
+
+    const textFiles = [];
+    const imageFiles = [];
+    const skipped = [];
+    let imagesDecoded = 0;
+
+    for (const entry of entries) {
+      const ext = extOf(entry.entryName);
+      if (TEXT_EXTENSIONS.has(ext) || ext === '') {
+        let content = entry.getData().toString('utf8');
+        let truncated = false;
+        if (content.length > ZIP_TEXT_TRUNCATE) {
+          content = content.slice(0, ZIP_TEXT_TRUNCATE);
+          truncated = true;
+        }
+        textFiles.push({ path: entry.entryName, content, truncated });
+      } else if (IMAGE_EXTENSIONS.has(ext) && imagesDecoded < ZIP_MAX_IMAGES) {
+        const data = entry.getData();
+        if (data.length <= ZIP_IMAGE_MAX_BYTES) {
+          imageFiles.push({ path: entry.entryName, content_base64: data.toString('base64'), mime_type: mimeForImageExt(ext) });
+          imagesDecoded++;
+        } else {
+          skipped.push(`${entry.entryName} (imagem demasiado grande)`);
+        }
+      } else {
+        skipped.push(entry.entryName);
+      }
+    }
+
+    return {
+      found: true,
+      total_files: entries.length,
+      text_files: textFiles,
+      image_files: imageFiles,
+      skipped_files: skipped,
+      note: skipped.length > 0 ? `${skipped.length} ficheiro(s) não foram lidos (formato binário não suportado ou limite de imagens atingido).` : null,
+    };
+  } catch (e) {
+    return { found: false, reason: `Erro ao ler ZIP: ${e.message}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// READ PDF CONTENTS — extração de texto por página
+// ═══════════════════════════════════════════════════════════
+async function readPdfContentsImpl(pdfBase64) {
+  try {
+    const buffer = Buffer.from(pdfBase64 || '', 'base64');
+    if (buffer.length === 0) return { found: false, reason: "PDF vazio ou inválido." };
+
+    let pageTexts = [];
+    const parsed = await pdfParse(buffer, {
+      max: PDF_MAX_PAGES_TEXT,
+      pagerender: async (pageData) => {
+        const textContent = await pageData.getTextContent();
+        const text = textContent.items.map(it => it.str).join(' ');
+        pageTexts.push(text);
+        return text;
+      },
+    });
+
+    const totalPages = parsed.numpages || pageTexts.length;
+    const truncated = totalPages > PDF_MAX_PAGES_TEXT;
+
+    return {
+      found: true,
+      total_pages: totalPages,
+      pages_read: Math.min(totalPages, PDF_MAX_PAGES_TEXT),
+      truncated,
+      pages: pageTexts.map((text, i) => ({ page: i + 1, text: text.trim() })),
+      note: truncated ? `PDF tem ${totalPages} páginas; apenas as primeiras ${PDF_MAX_PAGES_TEXT} foram lidas.` : null,
+    };
+  } catch (e) {
+    return { found: false, reason: `Erro ao ler PDF: ${e.message}` };
   }
 }
 
@@ -907,13 +1349,13 @@ function jsonTransformImpl(jsonData) {
 }
 
 async function htmlToDocxImpl(htmlContent, filename) {
-  const result = await createDocxImpl(filename || 'documento', htmlContent);
+  const result = await createDocxImpl(filename || 'documento', htmlContent, [], null);
   if (result.found) result.filename = `${sanitizeFilename(filename || 'documento')}.docx`;
   return result;
 }
 
 async function htmlToPdfImpl(htmlContent, title) {
-  return await createPdfImpl(title || 'documento', htmlContent);
+  return await createPdfImpl(title || 'documento', htmlContent, [], null);
 }
 
 async function htmlToXlsxImpl(htmlContent, sheetName) {
@@ -1081,29 +1523,36 @@ const HEAVY_TOOLS = new Set([
   'create_pdf','create_docx','create_xlsx','create_pptx',
   'csv_to_xlsx',
   'html_to_docx','html_to_pdf','html_to_xlsx','html_to_pptx',
-  'generate_chart','generate_mindmap','generate_math','generate_table_image','generate_html_image',
+  'generate_chart','generate_function_plot','generate_mindmap','generate_math','generate_table_image','generate_html_image',
   'get_weather',
+  'create_project_zip','read_zip_contents','read_pdf_contents',
+  'download_image_for_project',
 ]);
 
 async function runTool(name, input) {
   switch (name) {
     case "web_search": return await webSearchImpl(input?.query || '');
     case "search_images": return await searchImagesImpl(input?.query || '');
+    case "download_image_for_project": return await downloadImageForProjectImpl(input?.query_or_url || '', input?.target_filename);
     case "search_market": return await searchMarketImpl(input?.query || '');
     case "search_place": return await searchPlaceImpl(input?.query || '');
     case "search_calendar_date": return await searchCalendarDateImpl(input?.query || '');
     case "get_weather": return await getWeatherImpl(input?.city || '');
     case "generate_chart": return await generateChartImpl(input.chart_type, input.title, input.labels, input.datasets);
+    case "generate_function_plot": return await generateFunctionPlotImpl(input.expression, input.x_min, input.x_max, input.title, input.highlight_roots);
     case "generate_mindmap": return await generateMindmapImpl(input.root);
     case "generate_qrcode": return await generateQrcodeImpl(input.content, input.size);
     case "generate_barcode": return await generateBarcodeImpl(input.content, input.format);
-    case "generate_math": return await generateMathImpl(input.expression, input.variable_range);
+    case "generate_math": return await generateMathImpl(input.expression);
     case "generate_table_image": return await generateTableImageImpl(input.title, input.headers, input.rows);
     case "generate_html_image": return await generateHtmlImageImpl(input.html, input.width, input.height);
-    case "create_pdf": return await createPdfImpl(input.title, input.html_content);
-    case "create_docx": return await createDocxImpl(input.title, input.html_content);
+    case "create_pdf": return await createPdfImpl(input.title, input.html_content, input.image_urls, input.embed_chart);
+    case "create_docx": return await createDocxImpl(input.title, input.html_content, input.image_urls, input.embed_chart);
     case "create_xlsx": return await createXlsxImpl(input.sheet_name, input.headers, input.rows);
     case "create_pptx": return await createPptxImpl(input.title, input.slides);
+    case "create_project_zip": return await createProjectZipImpl(input.project_name, input.files, input.image_urls_to_include);
+    case "read_zip_contents": return await readZipContentsImpl(input.zip_base64);
+    case "read_pdf_contents": return await readPdfContentsImpl(input.pdf_base64);
     case "csv_to_xlsx": return await csvToXlsxImpl(input.csv_content);
     case "json_transform": return jsonTransformImpl(input.json_data);
     case "html_to_docx": return await htmlToDocxImpl(input.html_content, input.filename);
@@ -1115,7 +1564,7 @@ async function runTool(name, input) {
 }
 
 async function executeTool(name, input) {
-  if (HEAVY_TOOLS.has(name)) return enqueueHeavy(withTimeout(() => runTool(name, input)));
+  if (HEAVY_TOOLS.has(name)) return enqueueHeavy(withTimeout(() => runTool(name, input), 45000));
   return runTool(name, input);
 }
 
