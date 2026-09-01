@@ -19,8 +19,14 @@
     "bwip-js": "^3.4.2",
     "mathjs": "^13.0.0",
     "satori": "^0.10.13",
+    "satori-html": "^0.3.2",
     "sharp": "^0.33.4",
     "adm-zip": "^0.5.15",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "pdf-lib": "^1.17.1",
+    "tesseract.js": "^5.1.0",
+    "mammoth": "^1.7.2",
+    "music-metadata": "^7.14.0",
+    "potrace": "^2.1.8"
   }
 }
