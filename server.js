@@ -1915,6 +1915,27 @@ app.post('/run-tool', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════
+// ALIAS — /tools/execute aponta para o mesmo runTool() que
+// /run-tool. O worker Cloudflare (handleToolsExecute) chama
+// TOOLS_SERVER_BASE + "/tools/execute" — essa rota nunca existiu
+// aqui depois da reescrita das 61 tools, por isso o worker
+// recebia 404 em HTML do Express e rebentava no res.json() com
+// "Unexpected token '<'". Mesma lógica do /run-tool, nome
+// diferente, sem duplicar código.
+// ═══════════════════════════════════════════════════════════
+app.post('/tools/execute', async (req, res) => {
+  const { name, input } = req.body || {};
+  if (!name) return res.status(400).json({ found: false, reason: "Campo 'name' é obrigatório." });
+  try {
+    const result = await runTool(name, input);
+    res.json(result);
+  } catch (e) {
+    console.error(`[runTool] Erro não tratado em "${name}":`, e);
+    res.status(500).json({ found: false, reason: `Erro interno ao executar "${name}": ${e.message}` });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 nexa-tools-api a correr na porta ${PORT}`);
   console.log(`📦 ${tools.length} tools registadas (${HEAVY_TOOL_NAMES.size} atrás de ENABLE_HEAVY_TOOLS=${ENABLE_HEAVY_TOOLS})`);
