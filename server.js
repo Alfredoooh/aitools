@@ -7,46 +7,26 @@ const html = require('satori-html').html;
 const sharp = require('sharp');
 const math = require('mathjs');
 const PDFDocument = require('pdfkit');
-const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, ImageRun } = require('docx');
 const ExcelJS = require('exceljs');
 const PptxGenJS = require('pptxgenjs');
 const cheerio = require('cheerio');
 const htmlToDocx = require('@turbodocx/html-to-docx');
 const AdmZip = require('adm-zip');
 const pdfParse = require('pdf-parse');
-const { createCanvas, loadImage } = require('canvas');
+const pdfLib = require('pdf-lib');
+const Tesseract = require('tesseract.js');
+const mammoth = require('mammoth');
+const musicMetadata = require('music-metadata');
+const potrace = require('potrace');
 const fs = require('fs');
 const path = require('path');
-
-// ═══════════════════════════════════════════════════════════
-// DEPENDÊNCIAS OPCIONAIS — libs para as tools novas que ainda
-// não estão no package.json. Carregadas com try/require para
-// não rebentar o arranque do servidor se faltar alguma; cada
-// tool que precisar delas devolve erro claro em vez de crashar.
-// Adiciona ao package.json quando quiseres ativar:
-//   "pdf-lib": "^1.17.1"        → merge_pdfs, split_pdf_pages
-//   "tesseract.js": "^5.1.0"    → ocr_extract_text
-//   "mammoth": "^1.7.2"         → docx_to_html
-//   "music-metadata": "^7.14.0" → audio_duration_check
-//   "potrace": "^2.1.8"         → vectorize_image
-// ═══════════════════════════════════════════════════════════
-let pdfLib = null;
-try { pdfLib = require('pdf-lib'); } catch (e) {}
-let Tesseract = null;
-try { Tesseract = require('tesseract.js'); } catch (e) {}
-let mammoth = null;
-try { mammoth = require('mammoth'); } catch (e) {}
-let musicMetadata = null;
-try { musicMetadata = require('music-metadata'); } catch (e) {}
-let potrace = null;
-try { potrace = require('potrace'); } catch (e) {}
 
 const app = express();
 app.use(express.json({ limit: '20mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ═══════════════════════════════════════════════════════════
-// CHAVES DE API — via variáveis de ambiente
+// CHAVES DE API
 // ═══════════════════════════════════════════════════════════
 const SERPER_API_KEY = process.env.SERPER_API_KEY || '';
 
@@ -58,22 +38,28 @@ const SERPER_API_KEY = process.env.SERPER_API_KEY || '';
 const ENABLE_HEAVY_TOOLS = process.env.ENABLE_HEAVY_TOOLS === 'true';
 
 // ═══════════════════════════════════════════════════════════
-// FONTE — satori exige buffer de fonte manual (não lê @font-face
-// nem fontes de sistema). Coloca um Inter-Regular.ttf e um
-// Inter-Bold.ttf em ./fonts/ na raiz do projeto.
+// FONTES — satori exige buffer de fonte manual (não lê @font-face
+// nem fontes de sistema). Coloca Inter-Regular.ttf, Inter-Bold.ttf
+// e Inter-SemiBold.ttf (opcional) em ./fonts/ na raiz do projeto.
 // Download: https://fonts.google.com/specimen/Inter
 // ═══════════════════════════════════════════════════════════
 let FONT_REGULAR = null;
 let FONT_BOLD = null;
+let FONT_SEMIBOLD = null;
 try {
   FONT_REGULAR = fs.readFileSync(path.join(__dirname, 'fonts', 'Inter-Regular.ttf'));
   FONT_BOLD = fs.readFileSync(path.join(__dirname, 'fonts', 'Inter-Bold.ttf'));
+  try {
+    FONT_SEMIBOLD = fs.readFileSync(path.join(__dirname, 'fonts', 'Inter-SemiBold.ttf'));
+  } catch (e) {
+    FONT_SEMIBOLD = FONT_BOLD;
+  }
 } catch (e) {
-  console.warn('⚠️  Fontes não encontradas em ./fonts/ — generate_html_image e create_pdf vão falhar até adicionares Inter-Regular.ttf e Inter-Bold.ttf');
+  console.warn('⚠️  Fontes não encontradas em ./fonts/ — tools baseadas em satori vão falhar até adicionares Inter-Regular.ttf e Inter-Bold.ttf');
 }
 
 // ═══════════════════════════════════════════════════════════
-// FILA — evita 2 operações pesadas simultâneas
+// FILA — evita operações pesadas simultâneas (protege os 512MB)
 // ═══════════════════════════════════════════════════════════
 let queueTail = Promise.resolve();
 function enqueueHeavy(fn) {
@@ -91,7 +77,7 @@ function withTimeout(fn, ms = 30000) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// LIMITES — ZIP / arquivos / PDF / imagem, ajustados para free
+// LIMITES — ajustados para o free tier de 512MB
 // ═══════════════════════════════════════════════════════════
 const ZIP_MAX_BYTES = 15 * 1024 * 1024;
 const ZIP_MAX_FILES = 100;
@@ -100,6 +86,8 @@ const ZIP_MAX_IMAGES = 10;
 const ZIP_IMAGE_MAX_BYTES = 1.5 * 1024 * 1024;
 const PDF_MAX_PAGES_TEXT = 40;
 const VECTORIZE_MAX_DIMENSION = 2000;
+const SERPER_MAX_RESULTS = 100; // teto real do Serper por página em /images, /videos e /search
+const WEBSITE_READ_MAX_CHARS = 20000;
 
 const TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.json', '.yaml', '.yml', '.xml', '.csv', '.tsv',
@@ -119,7 +107,7 @@ function mimeForImageExt(ext) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HELPERS DE TEXTO/FICHEIRO — usados por várias tools
+// HELPERS DE TEXTO/FICHEIRO
 // ═══════════════════════════════════════════════════════════
 function escapeHtml(str) {
   return String(str == null ? '' : str)
@@ -140,9 +128,6 @@ function sanitizeFilename(name) {
     .slice(0, 60) || 'documento';
 }
 
-// ═══════════════════════════════════════════════════════════
-// DATA ATUAL
-// ═══════════════════════════════════════════════════════════
 function getCurrentDateInfo() {
   const now = new Date();
   const days = ['domingo','segunda-feira','terça-feira','quarta-feira','quinta-feira','sexta-feira','sábado'];
@@ -156,9 +141,6 @@ function getCurrentDateInfo() {
   };
 }
 
-// ═══════════════════════════════════════════════════════════
-// FETCH DE IMAGEM EXTERNA → base64 (usado por PDF/DOCX/ZIP)
-// ═══════════════════════════════════════════════════════════
 async function fetchImageAsBase64(url) {
   const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
   if (!r.ok) throw new Error(`Falha ao descarregar imagem (${r.status}): ${url}`);
@@ -167,6 +149,23 @@ async function fetchImageAsBase64(url) {
   const contentType = r.headers.get('content-type') || 'image/png';
   return { base64: buffer.toString('base64'), mimeType: contentType, buffer };
 }
+
+// ═══════════════════════════════════════════════════════════
+// PALETA DE DESIGN COMPARTILHADA — usada por chart, pdf, tabela,
+// math, mindmap, weather, avatar, para manter tudo consistente
+// e evitar o visual "genérico" das versões anteriores.
+// ═══════════════════════════════════════════════════════════
+const DESIGN = {
+  palette: ['#4F46E5', '#0EA5E9', '#F59E0B', '#EF4444', '#10B981', '#8B5CF6', '#EC4899', '#14B8A6'],
+  ink: '#0F172A',
+  inkSoft: '#475569',
+  inkMuted: '#64748B',
+  border: '#E2E8F0',
+  surface: '#F8FAFC',
+  surfaceAlt: '#F1F5F9',
+  white: '#FFFFFF',
+  gridLine: '#EEF2F6',
+};
 
 // ═══════════════════════════════════════════════════════════
 // DEFINIÇÃO DAS TOOLS
@@ -181,14 +180,24 @@ const tools = [
     input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
   },
   {
+    name: "read_website",
+    description: "Lê o conteúdo completo de uma página web dado o URL, e devolve o texto limpo (sem menus, scripts, anúncios) mais título, descrição e links principais. Usa para resumir artigos, extrair informação de páginas específicas ou analisar conteúdo de um site.",
+    input_schema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] }
+  },
+  {
     name: "search_images",
-    description: "Pesquisa imagens reais na web via Serper. Devolve array de imagens (url, título, origem) para exibir em carrossel.",
-    input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
+    description: `Pesquisa imagens reais na web via Serper. Devolve até ${SERPER_MAX_RESULTS} imagens (url, título, origem, dimensões) para exibir em carrossel ou anexar a documentos.`,
+    input_schema: { type: "object", properties: { query: { type: "string" }, max_results: { type: "number", description: `Máximo ${SERPER_MAX_RESULTS}, default 30.` } }, required: ["query"] }
   },
   {
     name: "search_videos",
-    description: "Pesquisa vídeos reais na web via Serper (YouTube e outras plataformas indexadas). Devolve título, link, duração, canal e thumbnail.",
-    input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
+    description: `Pesquisa vídeos reais na web via Serper (YouTube e outras plataformas indexadas). Devolve até ${SERPER_MAX_RESULTS} resultados com título, link, duração, canal e thumbnail.`,
+    input_schema: { type: "object", properties: { query: { type: "string" }, max_results: { type: "number", description: `Máximo ${SERPER_MAX_RESULTS}, default 30.` } }, required: ["query"] }
+  },
+  {
+    name: "search_books",
+    description: "Pesquisa livros reais (Google Books): título, autor(es), editora, ano, descrição, capa, avaliação média e link de compra/leitura. Útil para recomendações, referências bibliográficas e verificação de dados de um livro.",
+    input_schema: { type: "object", properties: { query: { type: "string" }, max_results: { type: "number", description: "Máximo 40, default 10." } }, required: ["query"] }
   },
   {
     name: "download_image_for_project",
@@ -228,7 +237,7 @@ const tools = [
   // ─────────────────────────────────────────────────────────
   {
     name: "generate_chart",
-    description: "Gera um gráfico REAL (Chart.js) como PNG base64. Suporta line, bar, pie, doughnut, radar, polarArea, scatter, bubble.",
+    description: "Gera um gráfico REAL (Chart.js) como PNG base64, com design limpo e profissional. Suporta line, bar, pie, doughnut, radar, polarArea, scatter, bubble.",
     input_schema: {
       type: "object",
       properties: {
@@ -256,8 +265,13 @@ const tools = [
     }
   },
   {
+    name: "generate_math_sheet",
+    description: "Gera uma ficha matemática completa e organizada em PNG: expressão, resultado, e (quando a expressão tem variável x) o gráfico da função correspondente lado a lado — não é apenas um número solto.",
+    input_schema: { type: "object", properties: { expression: { type: "string" }, show_graph: { type: "boolean", description: "Se a expressão tiver x, tenta desenhar o gráfico da função ao lado do resultado. Default true." } }, required: ["expression"] }
+  },
+  {
     name: "generate_mindmap",
-    description: "Gera um mapa mental hierárquico como PNG base64.",
+    description: "Gera um mapa mental hierárquico como PNG base64, com cartões e conectores visuais.",
     input_schema: {
       type: "object",
       properties: { root: { type: "object", properties: { label: { type: "string" }, children: { type: "array", items: { type: "object" } } } } },
@@ -275,13 +289,8 @@ const tools = [
     input_schema: { type: "object", properties: { content: { type: "string" }, format: { type: "string", enum: ["code128", "ean13", "ean8", "upca", "qrcode"] } }, required: ["content"] }
   },
   {
-    name: "generate_math",
-    description: "Avalia uma expressão matemática pontual e gera imagem visual com o resultado.",
-    input_schema: { type: "object", properties: { expression: { type: "string" } }, required: ["expression"] }
-  },
-  {
     name: "generate_table_image",
-    description: "Gera uma tabela complexa como PNG base64.",
+    description: "Gera uma tabela complexa e bem formatada como PNG base64.",
     input_schema: {
       type: "object",
       properties: { title: { type: "string" }, headers: { type: "array", items: { type: "string" } }, rows: { type: "array", items: { type: "array", items: { type: "string" } } } },
@@ -298,28 +307,14 @@ const tools = [
     }
   },
   {
-    name: "generate_letter_card_svg",
-    description: "Gera um cartão de letra/sílaba estilo Duolingo: cor HSL, tipografia grande, para apps educacionais de literacia.",
-    input_schema: {
-      type: "object",
-      properties: { letter_or_syllable: { type: "string" }, hue: { type: "number", description: "0-360, opcional — se omitido usa color_from_letter_seed internamente" }, size: { type: "number" } },
-      required: ["letter_or_syllable"]
-    }
-  },
-  {
     name: "generate_color_scheme",
     description: "Gera uma paleta completa light/dark a partir de 1 cor base (hex), com tokens tipo AppColorScheme: primary, secondary, background, surface, text, em ambos os modos.",
     input_schema: { type: "object", properties: { base_color_hex: { type: "string" } }, required: ["base_color_hex"] }
   },
   {
     name: "generate_random_avatar",
-    description: "Gera um avatar geométrico determinístico (estilo identicon) a partir de uma seed (ex: user id ou email).",
+    description: "Gera um avatar geométrico único e determinístico a partir de uma seed (ex: user id ou email) — formas orgânicas variadas (círculos, blobs, triângulos sobrepostos), não um grid de blocos.",
     input_schema: { type: "object", properties: { seed: { type: "string" }, size: { type: "number" } }, required: ["seed"] }
-  },
-  {
-    name: "generate_memory_game_grid",
-    description: "Dado N pares de itens (ids/labels), devolve o layout embaralhado de grelha para um jogo da memória (posições + colunas ideais).",
-    input_schema: { type: "object", properties: { items: { type: "array", items: { type: "string" } }, columns: { type: "number" } }, required: ["items"] }
   },
 
   // ─────────────────────────────────────────────────────────
@@ -327,7 +322,7 @@ const tools = [
   // ─────────────────────────────────────────────────────────
   {
     name: "create_pdf",
-    description: "Gera um PDF a partir de HTML rico, com estilo real (via satori→imagem full-page A4, resolução de ecrã). Pode incluir imagens reais e gráfico embutido.",
+    description: "Gera um PDF profissional a partir de HTML rico, com cabeçalho, rodapé com paginação, tipografia cuidada e imagens reais embutidas corretamente (URLs são descarregadas e inseridas de facto no layout, não apenas referenciadas).",
     input_schema: {
       type: "object",
       properties: {
@@ -341,11 +336,12 @@ const tools = [
   },
   {
     name: "create_pdf_structured",
-    description: "Gera um PDF bem formatado a partir de JSON descritivo (secções, blocos de texto, imagens, gráficos) — layout garantido, sem depender de parsing de HTML livre.",
+    description: "Gera um PDF bem formatado a partir de JSON descritivo (secções, blocos de texto, imagens, gráficos, tabelas) — layout profissional garantido, com imagens de facto inseridas, sem depender de parsing de HTML livre.",
     input_schema: {
       type: "object",
       properties: {
         title: { type: "string" },
+        subtitle: { type: "string" },
         sections: {
           type: "array",
           items: {
@@ -355,6 +351,7 @@ const tools = [
               paragraphs: { type: "array", items: { type: "string" } },
               bullet_list: { type: "array", items: { type: "string" } },
               image_url: { type: "string" },
+              table: { type: "object", properties: { headers: { type: "array", items: { type: "string" } }, rows: { type: "array", items: { type: "array", items: { type: "string" } } } } },
               embed_chart: { type: "object" }
             }
           }
@@ -365,7 +362,7 @@ const tools = [
   },
   {
     name: "create_docx",
-    description: "Gera um Word (.docx) a partir de HTML.",
+    description: "Gera um Word (.docx) a partir de HTML, com imagens reais embutidas.",
     input_schema: {
       type: "object",
       properties: { title: { type: "string" }, html_content: { type: "string" }, image_urls: { type: "array", items: { type: "string" } }, embed_chart: { type: "object" } },
@@ -374,12 +371,12 @@ const tools = [
   },
   {
     name: "create_xlsx",
-    description: "Gera planilha Excel (.xlsx).",
+    description: "Gera planilha Excel (.xlsx) com cabeçalho estilizado e colunas ajustadas ao conteúdo.",
     input_schema: { type: "object", properties: { sheet_name: { type: "string" }, headers: { type: "array", items: { type: "string" } }, rows: { type: "array", items: { type: "array", items: { type: "string" } } } }, required: ["headers", "rows"] }
   },
   {
     name: "create_pptx",
-    description: "Gera PowerPoint (.pptx).",
+    description: "Gera PowerPoint (.pptx) com layout cuidado por slide.",
     input_schema: {
       type: "object",
       properties: { title: { type: "string" }, slides: { type: "array", items: { type: "object", properties: { heading: { type: "string" }, bullets: { type: "array", items: { type: "string" } } } } } },
@@ -444,7 +441,7 @@ const tools = [
   },
   {
     name: "html_to_pdf",
-    description: "Converte HTML em PDF com estilo real (via satori).",
+    description: "Converte HTML em PDF profissional (via satori), com cabeçalho e paginação.",
     input_schema: { type: "object", properties: { html_content: { type: "string" }, title: { type: "string" } }, required: ["html_content"] }
   },
   {
@@ -459,7 +456,7 @@ const tools = [
   },
   {
     name: "docx_to_html",
-    description: "Converte DOCX enviado (base64) em HTML editável, usando mammoth. [REQUER LIB 'mammoth' — ver topo do ficheiro]",
+    description: "Converte DOCX enviado (base64) em HTML editável, usando mammoth.",
     input_schema: { type: "object", properties: { docx_base64: { type: "string" } }, required: ["docx_base64"] }
   },
 
@@ -488,7 +485,7 @@ const tools = [
   },
   {
     name: "watermark_image",
-    description: "Sobrepõe uma marca d'água (texto simples via satori) numa imagem base.",
+    description: "Sobrepõe uma marca d'água (texto) numa imagem base.",
     input_schema: { type: "object", properties: { image_base64: { type: "string" }, watermark_text: { type: "string" }, position: { type: "string", enum: ["top-left", "top-right", "bottom-left", "bottom-right", "center"] } }, required: ["image_base64", "watermark_text"] }
   },
   {
@@ -498,12 +495,12 @@ const tools = [
   },
   {
     name: "vectorize_image",
-    description: `Converte PNG em SVG vetorizado (colorido ou preto/transparente). Limite: ${VECTORIZE_MAX_DIMENSION}px na maior dimensão — imagens maiores devem ser redimensionadas primeiro com resize_image. [REQUER LIB 'potrace' — ver topo do ficheiro]`,
+    description: `Converte PNG em SVG vetorizado (colorido ou preto/transparente). Limite: ${VECTORIZE_MAX_DIMENSION}px na maior dimensão — imagens maiores devem ser redimensionadas primeiro com resize_image.`,
     input_schema: { type: "object", properties: { image_base64: { type: "string" }, mode: { type: "string", enum: ["color", "black_transparent"] } }, required: ["image_base64"] }
   },
   {
     name: "ocr_extract_text",
-    description: "Extrai texto de uma imagem (OCR) via tesseract.js. Suporta português e inglês. [REQUER LIB 'tesseract.js' — ver topo do ficheiro]",
+    description: "Extrai texto de uma imagem (OCR) via tesseract.js. Suporta português e inglês.",
     input_schema: { type: "object", properties: { image_base64: { type: "string" }, language: { type: "string", enum: ["por", "eng"] } }, required: ["image_base64"] }
   },
   {
@@ -518,7 +515,7 @@ const tools = [
   },
   {
     name: "audio_duration_check",
-    description: "Lê a duração de um ficheiro de áudio (mp3/wav/m4a) sem descodificar o áudio todo. [REQUER LIB 'music-metadata' — ver topo do ficheiro]",
+    description: "Lê metadados completos de um ficheiro de áudio: duração, título, artista, álbum, ano, género, codec, sample rate, bitrate, canais e se tem capa embutida — sem descodificar o áudio todo.",
     input_schema: { type: "object", properties: { audio_base64: { type: "string" } }, required: ["audio_base64"] }
   },
 
@@ -556,45 +553,36 @@ const tools = [
     input_schema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] }
   },
   {
-    name: "text_to_syllables_pt",
-    description: "Divide uma palavra em português nas suas sílabas (heurística de regras comuns — não cobre 100% dos casos irregulares).",
-    input_schema: { type: "object", properties: { word: { type: "string" } }, required: ["word"] }
-  },
-  {
-    name: "color_from_letter_seed",
-    description: "Gera uma cor HSL determinística a partir de uma letra/sílaba/texto (mesma entrada = mesma cor sempre).",
-    input_schema: { type: "object", properties: { seed: { type: "string" } }, required: ["seed"] }
-  },
-  {
     name: "youtube_thumbnail_extract",
     description: "Extrai thumbnail e metadata básica (título) de um vídeo do YouTube dado o URL, via oEmbed público — sem API key.",
     input_schema: { type: "object", properties: { youtube_url: { type: "string" } }, required: ["youtube_url"] }
   },
   {
     name: "merge_pdfs",
-    description: "Junta múltiplos PDFs (base64) num único PDF, na ordem dada. [REQUER LIB 'pdf-lib' — ver topo do ficheiro]",
+    description: "Junta múltiplos PDFs (base64) num único PDF, na ordem dada.",
     input_schema: { type: "object", properties: { pdfs_base64: { type: "array", items: { type: "string" } } }, required: ["pdfs_base64"] }
   },
   {
     name: "split_pdf_pages",
-    description: "Extrai um subconjunto de páginas de um PDF para um novo PDF. [REQUER LIB 'pdf-lib' — ver topo do ficheiro]",
+    description: "Extrai um subconjunto de páginas de um PDF para um novo PDF.",
     input_schema: { type: "object", properties: { pdf_base64: { type: "string" }, page_numbers: { type: "array", items: { type: "number" } } }, required: ["pdf_base64", "page_numbers"] }
   },
 ];
 
 // ─────────────────────────────────────────────────────────
 // TOOLS PESADAS — registadas mas só ficam utilizáveis com
-// ENABLE_HEAVY_TOOLS=true. Ver runTool() para o bloqueio real.
+// ENABLE_HEAVY_TOOLS=true. Não cabem confortavelmente em 512MB
+// (motor de vídeo / composição de muitas camadas). Ver runTool().
 // ─────────────────────────────────────────────────────────
 tools.push(
   {
     name: "animate_html",
-    description: "[REQUER ENABLE_HEAVY_TOOLS] Anima HTML+CSS ao longo do tempo e exporta como vídeo curto/longo (duração conforme timing do HTML). Requer motor de vídeo — indisponível no free tier.",
+    description: "[REQUER ENABLE_HEAVY_TOOLS] Anima HTML+CSS ao longo do tempo e exporta como vídeo curto/longo (duração conforme timing do HTML). Requer motor de vídeo — indisponível no free tier de 512MB.",
     input_schema: { type: "object", properties: { html: { type: "string" }, duration_seconds: { type: "number" } }, required: ["html", "duration_seconds"] }
   },
   {
     name: "generate_infographic",
-    description: "[REQUER ENABLE_HEAVY_TOOLS] Gera infográfico com ícones e blocos organizados a partir de dados estruturados.",
+    description: "[REQUER ENABLE_HEAVY_TOOLS] Gera infográfico com ícones e blocos organizados a partir de dados estruturados. Composição pesada — indisponível no free tier de 512MB.",
     input_schema: { type: "object", properties: { title: { type: "string" }, blocks: { type: "array", items: { type: "object" } } }, required: ["title", "blocks"] }
   }
 );
@@ -616,14 +604,16 @@ async function htmlToSvgViaSatori(htmlString, width, height) {
     height: height || 600,
     fonts: [
       { name: 'Inter', data: FONT_REGULAR, weight: 400, style: 'normal' },
+      { name: 'Inter', data: FONT_SEMIBOLD || FONT_BOLD, weight: 600, style: 'normal' },
       { name: 'Inter', data: FONT_BOLD, weight: 700, style: 'normal' },
     ],
   });
   return svg;
 }
 
-async function svgToPngBuffer(svgString) {
-  return await sharp(Buffer.from(svgString)).png().toBuffer();
+async function svgToPngBuffer(svgString, scale) {
+  const density = 72 * (scale || 2); // renderiza em @2x por defeito, evita PNG borrado
+  return await sharp(Buffer.from(svgString), { density }).png().toBuffer();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -640,7 +630,8 @@ async function generateHtmlImageImpl(htmlContent, width, height) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// CREATE PDF — via satori→PNG full-page A4, resolução de ecrã
+// CREATE PDF — layout A4 profissional: cabeçalho, corpo, rodapé
+// com paginação, via satori→PNG full-page, resolução de ecrã.
 // ═══════════════════════════════════════════════════════════
 const A4_WIDTH_PX = 794;
 const A4_HEIGHT_PX = 1123;
@@ -649,27 +640,86 @@ const A4_HEIGHT_PT = 841.89;
 
 async function generateChartImpl(chartType, title, labels, datasets) {
   try {
-    const width = 800, height = 500;
-    const chartCanvas = new ChartJSNodeCanvas({ width, height, backgroundColour: 'white' });
-    const palette = ['#4F46E5', '#06B6D4', '#F59E0B', '#EF4444', '#10B981', '#8B5CF6', '#EC4899', '#84CC16'];
+    const width = 900, height = 540;
+    const chartCanvas = new ChartJSNodeCanvas({
+      width, height,
+      backgroundColour: '#ffffff',
+      chartCallback: (ChartJS) => {
+        ChartJS.defaults.font.family = "'Helvetica Neue', Arial, sans-serif";
+        ChartJS.defaults.font.size = 12.5;
+        ChartJS.defaults.color = DESIGN.inkSoft;
+      },
+    });
+
+    const isPie = ['pie', 'doughnut', 'polarArea'].includes(chartType);
+    const isRadar = chartType === 'radar';
+    const palette = DESIGN.palette;
+
     const config = {
       type: chartType,
       data: {
         labels: labels || [],
-        datasets: (datasets || []).map((d, i) => ({
-          label: d.label || `Série ${i + 1}`,
-          data: d.data || [],
-          backgroundColor: d.color || palette[i % palette.length],
-          borderColor: d.color || palette[i % palette.length],
-          borderWidth: 2,
-          fill: chartType === 'radar' || chartType === 'polarArea',
-        })),
+        datasets: (datasets || []).map((d, i) => {
+          const color = d.color || palette[i % palette.length];
+          const soft = (d.color || palette[i % palette.length]) + '26';
+          return {
+            label: d.label || `Série ${i + 1}`,
+            data: d.data || [],
+            borderColor: isPie ? '#ffffff' : color,
+            backgroundColor: isPie
+              ? (d.data || []).map((_, j) => palette[j % palette.length])
+              : (chartType === 'line' ? soft : color),
+            borderWidth: chartType === 'line' ? 3 : (isPie ? 2 : 0),
+            borderRadius: chartType === 'bar' ? 6 : 0,
+            fill: chartType === 'line' ? true : (isRadar || chartType === 'polarArea'),
+            tension: 0.35,
+            pointRadius: chartType === 'line' ? 3 : undefined,
+            pointBackgroundColor: color,
+            pointBorderColor: '#ffffff',
+            pointBorderWidth: 1.5,
+            pointHoverRadius: 5,
+            hoverOffset: isPie ? 10 : undefined,
+          };
+        }),
       },
       options: {
         responsive: false,
+        layout: { padding: { top: title ? 6 : 20, right: 24, bottom: 8, left: 8 } },
         plugins: {
-          title: { display: !!title, text: title || '', font: { size: 18 } },
-          legend: { display: (datasets || []).length > 1 },
+          title: {
+            display: !!title,
+            text: title || '',
+            font: { size: 19, weight: '700' },
+            color: DESIGN.ink,
+            padding: { bottom: 18 },
+            align: 'start',
+          },
+          legend: {
+            display: (datasets || []).length > 1 || isPie,
+            position: 'bottom',
+            labels: {
+              usePointStyle: true,
+              pointStyle: 'circle',
+              boxWidth: 8,
+              boxHeight: 8,
+              padding: 16,
+              font: { size: 12.5, weight: '500' },
+              color: DESIGN.inkSoft,
+            },
+          },
+        },
+        scales: isPie ? {} : {
+          x: {
+            grid: { display: false },
+            border: { display: true, color: DESIGN.border },
+            ticks: { font: { size: 11.5 }, color: DESIGN.inkMuted },
+          },
+          y: {
+            beginAtZero: true,
+            grid: { color: DESIGN.gridLine },
+            border: { display: false },
+            ticks: { font: { size: 11.5 }, color: DESIGN.inkMuted, padding: 8 },
+          },
         },
       },
     };
@@ -680,29 +730,51 @@ async function generateChartImpl(chartType, title, labels, datasets) {
   }
 }
 
+// ── HTML helpers de layout de documento (cabeçalho/rodapé/imagem real) ──
+function pdfHeaderHtml(title, subtitle) {
+  return `<div style="display:flex; flex-direction:column; padding-bottom:22px; margin-bottom:22px; border-bottom:2px solid ${DESIGN.ink};">
+    <div style="display:flex; font-size:24px; font-weight:700; color:${DESIGN.ink};">${escapeHtml(title || 'Documento')}</div>
+    ${subtitle ? `<div style="display:flex; font-size:13px; color:${DESIGN.inkMuted}; padding-top:6px;">${escapeHtml(subtitle)}</div>` : ''}
+  </div>`;
+}
+
+function pdfFooterHtml(pageLabel) {
+  return `<div style="display:flex; justify-content:space-between; padding-top:16px; margin-top:auto; border-top:1px solid ${DESIGN.border}; font-size:10.5px; color:${DESIGN.inkMuted};">
+    <div style="display:flex;">Gerado em ${escapeHtml(getCurrentDateInfo().full)}</div>
+    <div style="display:flex;">${escapeHtml(pageLabel || '')}</div>
+  </div>`;
+}
+
+async function buildRealImageBlockHtml(url, maxWidthPx) {
+  try {
+    const { base64 } = await fetchImageAsBase64(url);
+    return `<div style="display:flex; padding:10px 0; justify-content:center;"><img src="data:image/png;base64,${base64}" style="max-width:${maxWidthPx || 700}px; border-radius:10px;" /></div>`;
+  } catch (e) {
+    return `<div style="display:flex; padding:8px 0; font-size:11px; color:${DESIGN.inkMuted};">[Imagem indisponível: ${escapeHtml(url)}]</div>`;
+  }
+}
+
 async function createPdfImpl(title, htmlContent, imageUrls, embedChart) {
   return new Promise(async (resolve) => {
     try {
       let bodyHtml = htmlContent || '';
       let extraImagesHtml = '';
       for (const url of (imageUrls || []).slice(0, 6)) {
-        try {
-          const { base64 } = await fetchImageAsBase64(url);
-          extraImagesHtml += `<div style="display:flex; padding:8px 0;"><img src="data:image/png;base64,${base64}" style="max-width:100%; border-radius:8px;" /></div>`;
-        } catch (_) {}
+        extraImagesHtml += await buildRealImageBlockHtml(url, 700);
       }
       if (embedChart && embedChart.chart_type) {
         try {
           const chartResult = await generateChartImpl(embedChart.chart_type, embedChart.title, embedChart.labels, embedChart.datasets);
           if (chartResult.found) {
-            extraImagesHtml += `<div style="display:flex; padding:8px 0;"><img src="data:image/png;base64,${chartResult.content_base64}" style="max-width:100%; border-radius:8px;" /></div>`;
+            extraImagesHtml += `<div style="display:flex; padding:10px 0; justify-content:center;"><img src="data:image/png;base64,${chartResult.content_base64}" style="max-width:700px; border-radius:10px; border:1px solid ${DESIGN.border};" /></div>`;
           }
         } catch (_) {}
       }
-      const fullHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:40px; background:white; font-family:Inter;">
-        <div style="display:flex; font-size:22px; font-weight:700; color:#1a1a1a; padding-bottom:16px;">${escapeHtml(title || 'Documento')}</div>
-        <div style="display:flex; flex-direction:column; font-size:13px; color:#333;">${bodyHtml}</div>
+      const fullHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:48px; background:${DESIGN.white}; font-family:Inter;">
+        ${pdfHeaderHtml(title)}
+        <div style="display:flex; flex-direction:column; flex:1; font-size:13px; line-height:1.6; color:${DESIGN.inkSoft};">${bodyHtml}</div>
         ${extraImagesHtml}
+        ${pdfFooterHtml('Página 1')}
       </div>`;
       const svg = await htmlToSvgViaSatori(fullHtml, A4_WIDTH_PX, A4_HEIGHT_PX);
       const pageImageBuffer = await svgToPngBuffer(svg);
@@ -721,31 +793,38 @@ async function createPdfImpl(title, htmlContent, imageUrls, embedChart) {
   });
 }
 
-async function createPdfStructuredImpl(title, sections) {
+async function createPdfStructuredImpl(title, subtitle, sections) {
   try {
     let bodyHtml = '';
     for (const sec of (sections || [])) {
-      if (sec.heading) bodyHtml += `<div style="display:flex; font-size:16px; font-weight:700; color:#1a1a1a; padding:14px 0 6px 0;">${escapeHtml(sec.heading)}</div>`;
-      for (const p of (sec.paragraphs || [])) bodyHtml += `<div style="display:flex; font-size:12.5px; color:#333; padding-bottom:6px; line-height:1.5;">${escapeHtml(p)}</div>`;
+      if (sec.heading) bodyHtml += `<div style="display:flex; font-size:16px; font-weight:700; color:${DESIGN.ink}; padding:16px 0 8px 0;">${escapeHtml(sec.heading)}</div>`;
+      for (const p of (sec.paragraphs || [])) bodyHtml += `<div style="display:flex; font-size:12.5px; color:${DESIGN.inkSoft}; padding-bottom:8px; line-height:1.6;">${escapeHtml(p)}</div>`;
       if (sec.bullet_list && sec.bullet_list.length > 0) {
-        bodyHtml += `<div style="display:flex; flex-direction:column; padding:4px 0 8px 0;">`;
-        for (const item of sec.bullet_list) bodyHtml += `<div style="display:flex; font-size:12.5px; color:#333; padding-bottom:3px;">•  ${escapeHtml(item)}</div>`;
+        bodyHtml += `<div style="display:flex; flex-direction:column; padding:4px 0 10px 0;">`;
+        for (const item of sec.bullet_list) {
+          bodyHtml += `<div style="display:flex; padding:4px 0; font-size:12.5px; color:${DESIGN.inkSoft};"><div style="display:flex; width:6px; height:6px; border-radius:3px; background:${DESIGN.palette[0]}; margin:6px 10px 0 0;"></div><div style="display:flex; flex:1;">${escapeHtml(item)}</div></div>`;
+        }
         bodyHtml += `</div>`;
       }
+      if (sec.table && sec.table.headers && sec.table.headers.length > 0) {
+        const headerCells = sec.table.headers.map(h => `<div style="display:flex; flex:1; padding:8px 10px; font-weight:700; font-size:11.5px; color:${DESIGN.white};">${escapeHtml(h)}</div>`).join('');
+        const rowsHtml = (sec.table.rows || []).map((row, i) => `<div style="display:flex; background:${i % 2 === 0 ? DESIGN.surface : DESIGN.white};">${row.map(cell => `<div style="display:flex; flex:1; padding:7px 10px; font-size:11px; color:${DESIGN.inkSoft};">${escapeHtml(cell)}</div>`).join('')}</div>`).join('');
+        bodyHtml += `<div style="display:flex; flex-direction:column; margin:8px 0 14px 0; border-radius:8px; overflow:hidden; border:1px solid ${DESIGN.border};">
+          <div style="display:flex; background:${DESIGN.ink};">${headerCells}</div>
+          <div style="display:flex; flex-direction:column;">${rowsHtml}</div>
+        </div>`;
+      }
       if (sec.image_url) {
-        try {
-          const { base64 } = await fetchImageAsBase64(sec.image_url);
-          bodyHtml += `<div style="display:flex; padding:8px 0;"><img src="data:image/png;base64,${base64}" style="max-width:100%; border-radius:8px;" /></div>`;
-        } catch (_) {}
+        bodyHtml += await buildRealImageBlockHtml(sec.image_url, 650);
       }
       if (sec.embed_chart && sec.embed_chart.chart_type) {
         try {
           const chartResult = await generateChartImpl(sec.embed_chart.chart_type, sec.embed_chart.title, sec.embed_chart.labels, sec.embed_chart.datasets);
-          if (chartResult.found) bodyHtml += `<div style="display:flex; padding:8px 0;"><img src="data:image/png;base64,${chartResult.content_base64}" style="max-width:100%; border-radius:8px;" /></div>`;
+          if (chartResult.found) bodyHtml += `<div style="display:flex; padding:10px 0; justify-content:center;"><img src="data:image/png;base64,${chartResult.content_base64}" style="max-width:650px; border-radius:10px; border:1px solid ${DESIGN.border};" /></div>`;
         } catch (_) {}
       }
     }
-    return await createPdfImpl(title, bodyHtml, [], null);
+    return await createPdfImpl(title, bodyHtml, [], null, subtitle);
   } catch (e) {
     return { found: false, reason: `Erro ao gerar PDF estruturado: ${e.message}` };
   }
@@ -758,7 +837,9 @@ async function createDocxImpl(title, htmlContent, imageUrls, embedChart) {
       try {
         const { base64 } = await fetchImageAsBase64(url);
         extraHtml += `<p><img src="data:image/png;base64,${base64}" style="max-width:480px;" /></p>`;
-      } catch (_) {}
+      } catch (_) {
+        extraHtml += `<p><em>[Imagem indisponível: ${escapeHtml(url)}]</em></p>`;
+      }
     }
     if (embedChart && embedChart.chart_type) {
       try {
@@ -784,9 +865,20 @@ async function createXlsxImpl(sheetName, headers, rows) {
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet(sheetName || 'Folha1');
     sheet.addRow(headers || []);
-    sheet.getRow(1).font = { bold: true };
-    (rows || []).forEach(r => sheet.addRow(r));
-    sheet.columns.forEach(col => { col.width = 18; });
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F172A' } };
+    headerRow.alignment = { vertical: 'middle' };
+    (rows || []).forEach((r, i) => {
+      const row = sheet.addRow(r);
+      if (i % 2 === 0) row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
+    });
+    sheet.columns.forEach(col => {
+      let maxLen = 10;
+      col.eachCell({ includeEmpty: true }, cell => { maxLen = Math.max(maxLen, String(cell.value || '').length); });
+      col.width = Math.min(40, maxLen + 4);
+    });
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
     const buffer = await workbook.xlsx.writeBuffer();
     return {
       found: true, content_base64: Buffer.from(buffer).toString('base64'), filename: `${sanitizeFilename(sheetName || 'planilha')}.xlsx`,
@@ -801,12 +893,14 @@ async function createPptxImpl(title, slides) {
   try {
     const pptx = new PptxGenJS();
     const titleSlide = pptx.addSlide();
-    titleSlide.addText(title || 'Apresentação', { x: 0.5, y: 2, w: 9, h: 1.5, fontSize: 32, bold: true, align: 'center' });
+    titleSlide.background = { color: '0F172A' };
+    titleSlide.addText(title || 'Apresentação', { x: 0.5, y: 2.1, w: 9, h: 1.5, fontSize: 34, bold: true, align: 'center', color: 'FFFFFF' });
     (slides || []).forEach(s => {
       const slide = pptx.addSlide();
-      slide.addText(s.heading || '', { x: 0.5, y: 0.4, w: 9, h: 0.8, fontSize: 24, bold: true });
+      slide.addText(s.heading || '', { x: 0.5, y: 0.4, w: 9, h: 0.8, fontSize: 24, bold: true, color: '0F172A' });
+      slide.addShape('rect', { x: 0.5, y: 1.15, w: 1.2, h: 0.04, fill: { color: '4F46E5' } });
       (s.bullets || []).forEach((bullet, i) => {
-        slide.addText(bullet, { x: 0.7, y: 1.3 + i * 0.5, w: 8.6, h: 0.5, fontSize: 16, bullet: true });
+        slide.addText(bullet, { x: 0.7, y: 1.45 + i * 0.5, w: 8.6, h: 0.5, fontSize: 16, bullet: { code: '2022' }, color: '334155' });
       });
     });
     const buffer = await pptx.write({ outputType: 'nodebuffer' });
@@ -869,51 +963,133 @@ async function webSearchImpl(query) {
   }
 }
 
-async function searchImagesImpl(query) {
+async function readWebsiteImpl(url) {
+  const trimmed = (url || '').trim();
+  if (!trimmed) return { found: false, reason: "url vazio." };
+  if (!/^https?:\/\//i.test(trimmed)) return { found: false, reason: "url precisa de começar com http:// ou https://." };
+  try {
+    const r = await fetch(trimmed, {
+      signal: AbortSignal.timeout(15000),
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; nexa-tools-api/2.2.0; +https://nexa.app)' },
+    });
+    if (!r.ok) return { found: false, reason: `Site devolveu status ${r.status}.` };
+    const contentType = r.headers.get('content-type') || '';
+    if (!contentType.includes('text/html') && !contentType.includes('text/plain')) {
+      return { found: false, reason: `Conteúdo do URL não é HTML (content-type: ${contentType}).` };
+    }
+    const rawHtml = await r.text();
+    const $ = cheerio.load(rawHtml);
+    $('script, style, noscript, iframe, svg, nav, footer, [aria-hidden="true"]').remove();
+    const title = $('title').first().text().trim() || null;
+    const description = $('meta[name="description"]').attr('content') || $('meta[property="og:description"]').attr('content') || null;
+    const mainText = ($('article').text() || $('main').text() || $('body').text() || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const links = [];
+    $('a[href]').each((_, el) => {
+      const href = $(el).attr('href');
+      const text = $(el).text().trim();
+      if (href && text && links.length < 25 && /^https?:\/\//i.test(href)) links.push({ text: text.slice(0, 100), href });
+    });
+    if (!mainText) return { found: false, reason: "Não foi possível extrair texto legível da página." };
+    return {
+      found: true, url: trimmed, title, description,
+      text: mainText.slice(0, WEBSITE_READ_MAX_CHARS),
+      truncated: mainText.length > WEBSITE_READ_MAX_CHARS,
+      char_count_total: mainText.length,
+      links_sample: links,
+    };
+  } catch (e) {
+    return { found: false, reason: `Erro ao ler o site: ${e.message}` };
+  }
+}
+
+async function searchImagesImpl(query, maxResults) {
   const trimmed = (query || '').trim();
   if (!trimmed) return { found: false, reason: "Query vazia" };
   if (!SERPER_API_KEY) return { found: false, reason: "SERPER_API_KEY não configurada no servidor." };
+  const num = Math.min(SERPER_MAX_RESULTS, Math.max(1, maxResults || 30));
   try {
     const r = await fetch('https://google.serper.dev/images', {
       method: 'POST',
       headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: trimmed, gl: 'pt', hl: 'pt' }),
-      signal: AbortSignal.timeout(10000),
+      body: JSON.stringify({ q: trimmed, gl: 'pt', hl: 'pt', num }),
+      signal: AbortSignal.timeout(12000),
     });
     if (!r.ok) return { found: false, reason: `Serper devolveu ${r.status}` };
     const data = await r.json();
-    const images = (data.images || []).slice(0, 10).map(img => ({
-      title: img.title || '', url: img.imageUrl || '', thumbnailUrl: img.thumbnailUrl || img.imageUrl || '', source: img.source || '',
+    const images = (data.images || []).slice(0, num).map(img => ({
+      title: img.title || '', url: img.imageUrl || '', thumbnailUrl: img.thumbnailUrl || img.imageUrl || '',
+      source: img.source || '', width: img.imageWidth || null, height: img.imageHeight || null,
     })).filter(img => !!img.url);
     if (images.length === 0) return { found: false, reason: `Nenhuma imagem encontrada para "${trimmed}".` };
-    return { found: true, query: trimmed, images };
+    return { found: true, query: trimmed, total_returned: images.length, images };
   } catch (e) {
     return { found: false, reason: `Erro na pesquisa de imagens: ${e.message}` };
   }
 }
 
-async function searchVideosImpl(query) {
+async function searchVideosImpl(query, maxResults) {
   const trimmed = (query || '').trim();
   if (!trimmed) return { found: false, reason: "Query vazia" };
   if (!SERPER_API_KEY) return { found: false, reason: "SERPER_API_KEY não configurada no servidor." };
+  const num = Math.min(SERPER_MAX_RESULTS, Math.max(1, maxResults || 30));
   try {
     const r = await fetch('https://google.serper.dev/videos', {
       method: 'POST',
       headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: trimmed, gl: 'pt', hl: 'pt' }),
-      signal: AbortSignal.timeout(10000),
+      body: JSON.stringify({ q: trimmed, gl: 'pt', hl: 'pt', num }),
+      signal: AbortSignal.timeout(12000),
     });
     if (!r.ok) return { found: false, reason: `Serper devolveu ${r.status}` };
     const data = await r.json();
     if (!data.videos) console.error('[search_videos] campo "videos" ausente na resposta Serper:', JSON.stringify(data).slice(0, 500));
-    const videos = (data.videos || []).slice(0, 10).map(v => ({
+    const videos = (data.videos || []).slice(0, num).map(v => ({
       title: v.title || '', link: v.link || '', thumbnailUrl: v.imageUrl || '',
       channel: v.channel || v.source || '', duration: v.duration || null, date: v.date || null,
     })).filter(v => !!v.link);
     if (videos.length === 0) return { found: false, reason: `Nenhum vídeo encontrado para "${trimmed}".` };
-    return { found: true, query: trimmed, videos };
+    return { found: true, query: trimmed, total_returned: videos.length, videos };
   } catch (e) {
     return { found: false, reason: `Erro na pesquisa de vídeos: ${e.message}` };
+  }
+}
+
+async function searchBooksImpl(query, maxResults) {
+  const trimmed = (query || '').trim();
+  if (!trimmed) return { found: false, reason: "Query vazia" };
+  const num = Math.min(40, Math.max(1, maxResults || 10));
+  try {
+    const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(trimmed)}&maxResults=${num}&langRestrict=pt`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return { found: false, reason: `Google Books devolveu ${r.status}` };
+    const data = await r.json();
+    if (!data.items || data.items.length === 0) return { found: false, reason: `Nenhum livro encontrado para "${trimmed}".` };
+    const books = data.items.slice(0, num).map(item => {
+      const info = item.volumeInfo || {};
+      const sale = item.saleInfo || {};
+      return {
+        title: info.title || null,
+        subtitle: info.subtitle || null,
+        authors: info.authors || [],
+        publisher: info.publisher || null,
+        published_date: info.publishedDate || null,
+        description: info.description ? info.description.slice(0, 600) : null,
+        page_count: info.pageCount || null,
+        categories: info.categories || [],
+        average_rating: info.averageRating || null,
+        ratings_count: info.ratingsCount || null,
+        language: info.language || null,
+        thumbnail: (info.imageLinks && (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail)) || null,
+        preview_link: info.previewLink || null,
+        buy_link: sale.buyLink || null,
+        isbn_13: (info.industryIdentifiers || []).find(id => id.type === 'ISBN_13')?.identifier || null,
+      };
+    });
+    return { found: true, query: trimmed, total_returned: books.length, books };
+  } catch (e) {
+    return { found: false, reason: `Erro na pesquisa de livros: ${e.message}` };
   }
 }
 
@@ -923,7 +1099,7 @@ async function downloadImageForProjectImpl(queryOrUrl, targetFilename) {
   try {
     let finalUrl = trimmed;
     if (!/^https?:\/\//i.test(trimmed)) {
-      const searchResult = await searchImagesImpl(trimmed);
+      const searchResult = await searchImagesImpl(trimmed, 1);
       if (!searchResult.found || searchResult.images.length === 0) return { found: false, reason: `Nenhuma imagem encontrada para "${trimmed}".` };
       finalUrl = searchResult.images[0].url;
     }
@@ -961,7 +1137,7 @@ async function searchPlaceImpl(query) {
   if (!trimmed) return { found: false, reason: "Query vazia" };
   try {
     const r = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(trimmed)}&format=json&limit=1`, {
-      headers: { 'User-Agent': 'nexa-tools-api/2.1.0' }, signal: AbortSignal.timeout(10000),
+      headers: { 'User-Agent': 'nexa-tools-api/2.2.0' }, signal: AbortSignal.timeout(10000),
     });
     if (!r.ok) return { found: false, reason: `Nominatim devolveu ${r.status}` };
     const data = await r.json();
@@ -1011,15 +1187,18 @@ async function getWeatherImpl(city) {
     };
     const code = wData.current.weather_code;
     const label = weatherLabels[code] || 'Condição desconhecida';
-    const cardHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:32px; background:linear-gradient(135deg,#4F46E5,#06B6D4); font-family:Inter; color:white;">
+    const cardHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:36px; background:linear-gradient(135deg,#4F46E5,#0EA5E9); font-family:Inter; color:white;">
       <div style="display:flex; font-size:20px; font-weight:700;">${escapeHtml(loc.name)}</div>
-      <div style="display:flex; font-size:56px; font-weight:700; padding:16px 0;">${Math.round(wData.current.temperature_2m)}°C</div>
-      <div style="display:flex; font-size:16px;">${escapeHtml(label)}</div>
-      <div style="display:flex; font-size:13px; padding-top:12px; opacity:0.9;">Humidade: ${wData.current.relative_humidity_2m}% · Vento: ${Math.round(wData.current.wind_speed_10m)} km/h</div>
+      <div style="display:flex; align-items:flex-end;">
+        <div style="display:flex; font-size:64px; font-weight:700; padding-top:14px;">${Math.round(wData.current.temperature_2m)}°</div>
+        <div style="display:flex; font-size:20px; padding:0 0 14px 10px; opacity:0.85;">C</div>
+      </div>
+      <div style="display:flex; font-size:16px; font-weight:600;">${escapeHtml(label)}</div>
+      <div style="display:flex; font-size:13px; padding-top:14px; opacity:0.9;">Humidade: ${wData.current.relative_humidity_2m}%  ·  Vento: ${Math.round(wData.current.wind_speed_10m)} km/h</div>
     </div>`;
     let cardImage = null;
     try {
-      const svg = await htmlToSvgViaSatori(cardHtml, 400, 260);
+      const svg = await htmlToSvgViaSatori(cardHtml, 420, 280);
       const buffer = await svgToPngBuffer(svg);
       cardImage = buffer.toString('base64');
     } catch (_) {}
@@ -1056,7 +1235,7 @@ async function generateFunctionPlotImpl(expression, xMin, xMax, title, highlight
       }
       prevY = y; prevX = x;
     }
-    const chartResult = await generateChartImpl('line', title || `f(x) = ${expression}`, labels, [{ label: expression, data: values, color: '#4F46E5' }]);
+    const chartResult = await generateChartImpl('line', title || `f(x) = ${expression}`, labels, [{ label: expression, data: values, color: DESIGN.palette[0] }]);
     if (!chartResult.found) return chartResult;
     return { ...chartResult, roots_approx: highlightRoots ? roots : undefined };
   } catch (e) {
@@ -1064,19 +1243,88 @@ async function generateFunctionPlotImpl(expression, xMin, xMax, title, highlight
   }
 }
 
+function expressionHasVariableX(expression) {
+  try {
+    const node = math.parse(expression);
+    let hasX = false;
+    node.traverse(n => { if (n.isSymbolNode && n.name === 'x') hasX = true; });
+    return hasX;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function generateMathSheetImpl(expression, showGraph) {
+  try {
+    if (!expression) return { found: false, reason: "expression vazia." };
+    const wantsGraph = showGraph !== false && expressionHasVariableX(expression);
+
+    if (wantsGraph) {
+      // gera o gráfico da função e compõe um cartão único com expressão + gráfico
+      const min = -10, max = 10, steps = 200;
+      const labels = [], values = [];
+      for (let i = 0; i <= steps; i++) {
+        const x = min + (i / steps) * (max - min);
+        let y;
+        try { y = math.evaluate(expression, { x }); } catch (e) { return { found: false, reason: `Expressão inválida: ${e.message}` }; }
+        labels.push(x.toFixed(1));
+        values.push(typeof y === 'number' && isFinite(y) ? y : null);
+      }
+      const chartResult = await generateChartImpl('line', null, labels, [{ label: `f(x) = ${expression}`, data: values, color: DESIGN.palette[0] }]);
+      if (!chartResult.found) return chartResult;
+
+      let sampleAtZero = null;
+      try {
+        const y0 = math.evaluate(expression, { x: 0 });
+        if (typeof y0 === 'number' && isFinite(y0)) sampleAtZero = y0;
+      } catch (_) {}
+
+      const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:32px; background:${DESIGN.white}; font-family:Inter;">
+        <div style="display:flex; flex-direction:column; padding-bottom:18px; border-bottom:2px solid ${DESIGN.ink}; margin-bottom:20px;">
+          <div style="display:flex; font-size:12px; font-weight:600; color:${DESIGN.inkMuted}; letter-spacing:1px;">FICHA MATEMÁTICA</div>
+          <div style="display:flex; font-size:26px; font-weight:700; color:${DESIGN.ink}; padding-top:4px;">f(x) = ${escapeHtml(expression)}</div>
+        </div>
+        <div style="display:flex; padding-bottom:16px;">
+          <img src="data:image/png;base64,${chartResult.content_base64}" style="width:820px; border-radius:12px; border:1px solid ${DESIGN.border};" />
+        </div>
+        ${sampleAtZero !== null ? `<div style="display:flex; background:${DESIGN.surface}; border-radius:10px; padding:14px 18px;"><div style="display:flex; font-size:13px; color:${DESIGN.inkSoft};">Exemplo — em x = 0:  f(0) = ${escapeHtml(String(Math.round(sampleAtZero * 1000) / 1000))}</div></div>` : ''}
+      </div>`;
+      const svg = await htmlToSvgViaSatori(bodyHtml, 900, 680);
+      const buffer = await svgToPngBuffer(svg);
+      return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: `f(x) = ${expression}`, has_graph: true };
+    }
+
+    // sem variável x — expressão pontual, cartão simples mas bem desenhado
+    let result;
+    try { result = math.evaluate(expression); } catch (e) { return { found: false, reason: `Expressão inválida: ${e.message}` }; }
+    const resultStr = typeof result === 'number' ? (Number.isInteger(result) ? result.toString() : result.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')) : result.toString();
+    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:40px; background:${DESIGN.white}; font-family:Inter; align-items:center; justify-content:center;">
+      <div style="display:flex; font-size:12px; font-weight:600; color:${DESIGN.inkMuted}; letter-spacing:1px; padding-bottom:14px;">RESULTADO</div>
+      <div style="display:flex; font-size:22px; color:${DESIGN.inkMuted};">${escapeHtml(expression)}</div>
+      <div style="display:flex; font-size:56px; font-weight:700; color:${DESIGN.ink}; padding-top:14px;">= ${escapeHtml(resultStr)}</div>
+    </div>`;
+    const svg = await htmlToSvgViaSatori(bodyHtml, 640, 340);
+    const buffer = await svgToPngBuffer(svg);
+    return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: `${expression} = ${resultStr}`, result: resultStr, has_graph: false };
+  } catch (e) {
+    return { found: false, reason: `Erro ao gerar ficha matemática: ${e.message}` };
+  }
+}
+
 async function generateMindmapImpl(root) {
   try {
     if (!root || !root.label) return { found: false, reason: "root.label é obrigatório." };
-    function renderNode(node, depth) {
-      const childrenHtml = (node.children || []).map(c => renderNode(c, depth + 1)).join('');
-      const bg = depth === 0 ? '#4F46E5' : depth === 1 ? '#06B6D4' : '#94A3B8';
-      return `<div style="display:flex; flex-direction:column; align-items:flex-start; margin-left:${depth * 24}px;">
-        <div style="display:flex; background:${bg}; color:white; padding:8px 14px; border-radius:8px; font-size:${Math.max(12, 18 - depth * 2)}px; font-weight:700; margin-bottom:6px;">${escapeHtml(node.label || '')}</div>
-        ${childrenHtml ? `<div style="display:flex; flex-direction:column;">${childrenHtml}</div>` : ''}
+    const palette = DESIGN.palette;
+    function renderNode(node, depth, colorIdx) {
+      const childrenHtml = (node.children || []).map((c, i) => renderNode(c, depth + 1, colorIdx + i + 1)).join('');
+      const bg = depth === 0 ? DESIGN.ink : palette[colorIdx % palette.length];
+      return `<div style="display:flex; flex-direction:column; align-items:flex-start; margin-left:${depth * 28}px; padding-top:${depth === 0 ? 0 : 8}px;">
+        <div style="display:flex; background:${bg}; color:white; padding:9px 16px; border-radius:10px; font-size:${Math.max(12, 17 - depth * 1.5)}px; font-weight:${depth === 0 ? 700 : 600};">${escapeHtml(node.label || '')}</div>
+        ${childrenHtml ? `<div style="display:flex; flex-direction:column; padding-left:14px; border-left:2px solid ${DESIGN.border}; margin-left:8px; margin-top:6px;">${childrenHtml}</div>` : ''}
       </div>`;
     }
-    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:24px; background:white; font-family:Inter;">${renderNode(root, 0)}</div>`;
-    const svg = await htmlToSvgViaSatori(bodyHtml, 900, 700);
+    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:32px; background:${DESIGN.white}; font-family:Inter;">${renderNode(root, 0, 0)}</div>`;
+    const svg = await htmlToSvgViaSatori(bodyHtml, 960, 720);
     const buffer = await svgToPngBuffer(svg);
     return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: `Mapa mental: ${root.label}` };
   } catch (e) {
@@ -1087,7 +1335,7 @@ async function generateMindmapImpl(root) {
 async function generateQrcodeImpl(content, size) {
   try {
     if (!content) return { found: false, reason: "content vazio." };
-    const buffer = await QRCode.toBuffer(content, { width: size || 400, margin: 1 });
+    const buffer = await QRCode.toBuffer(content, { width: size || 400, margin: 1, color: { dark: DESIGN.ink, light: '#FFFFFF' } });
     return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: 'QR Code' };
   } catch (e) {
     return { found: false, reason: `Erro ao gerar QR code: ${e.message}` };
@@ -1109,68 +1357,25 @@ async function generateBarcodeImpl(content, format) {
   }
 }
 
-async function generateMathImpl(expression) {
-  try {
-    if (!expression) return { found: false, reason: "expression vazia." };
-    let result;
-    try { result = math.evaluate(expression); } catch (e) { return { found: false, reason: `Expressão inválida: ${e.message}` }; }
-    const resultStr = typeof result === 'number' ? (Number.isInteger(result) ? result.toString() : result.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')) : result.toString();
-    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:32px; background:white; font-family:Inter; align-items:center; justify-content:center;">
-      <div style="display:flex; font-size:20px; color:#666;">${escapeHtml(expression)}</div>
-      <div style="display:flex; font-size:48px; font-weight:700; color:#1a1a1a; padding-top:12px;">= ${escapeHtml(resultStr)}</div>
-    </div>`;
-    const svg = await htmlToSvgViaSatori(bodyHtml, 600, 300);
-    const buffer = await svgToPngBuffer(svg);
-    return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: `${expression} = ${resultStr}`, result: resultStr };
-  } catch (e) {
-    return { found: false, reason: `Erro ao calcular expressão: ${e.message}` };
-  }
-}
-
 async function generateTableImageImpl(title, headers, rows) {
   try {
     if (!headers || headers.length === 0) return { found: false, reason: "headers vazio." };
-    const headerCellsHtml = headers.map(h => `<div style="display:flex; flex:1; padding:10px 12px; font-weight:700; font-size:13px; color:white;">${escapeHtml(h)}</div>`).join('');
-    const rowsHtml = (rows || []).map((row, i) => `<div style="display:flex; background:${i % 2 === 0 ? '#F8FAFC' : '#FFFFFF'};">
-      ${row.map(cell => `<div style="display:flex; flex:1; padding:9px 12px; font-size:12px; color:#333;">${escapeHtml(cell)}</div>`).join('')}
+    const headerCellsHtml = headers.map(h => `<div style="display:flex; flex:1; padding:12px 14px; font-weight:700; font-size:13px; color:white;">${escapeHtml(h)}</div>`).join('');
+    const rowsHtml = (rows || []).map((row, i) => `<div style="display:flex; background:${i % 2 === 0 ? DESIGN.surface : DESIGN.white};">
+      ${row.map(cell => `<div style="display:flex; flex:1; padding:10px 14px; font-size:12.5px; color:${DESIGN.inkSoft};">${escapeHtml(cell)}</div>`).join('')}
     </div>`).join('');
-    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; background:white; font-family:Inter; border-radius:8px; overflow:hidden;">
-      ${title ? `<div style="display:flex; padding:14px 16px; font-size:16px; font-weight:700; color:#1a1a1a; background:#F1F5F9;">${escapeHtml(title)}</div>` : ''}
-      <div style="display:flex; background:#4F46E5;">${headerCellsHtml}</div>
+    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; background:white; font-family:Inter; border-radius:14px; overflow:hidden; border:1px solid ${DESIGN.border};">
+      ${title ? `<div style="display:flex; padding:16px 18px; font-size:16px; font-weight:700; color:${DESIGN.ink}; background:${DESIGN.surfaceAlt};">${escapeHtml(title)}</div>` : ''}
+      <div style="display:flex; background:${DESIGN.ink};">${headerCellsHtml}</div>
       <div style="display:flex; flex-direction:column;">${rowsHtml}</div>
     </div>`;
-    const width = Math.min(1200, Math.max(500, headers.length * 160));
-    const height = 60 + (title ? 44 : 0) + (rows || []).length * 40;
+    const width = Math.min(1200, Math.max(560, headers.length * 170));
+    const height = 70 + (title ? 50 : 0) + (rows || []).length * 42;
     const svg = await htmlToSvgViaSatori(bodyHtml, width, height);
     const buffer = await svgToPngBuffer(svg);
     return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: title || 'Tabela' };
   } catch (e) {
     return { found: false, reason: `Erro ao gerar tabela: ${e.message}` };
-  }
-}
-
-function colorFromLetterSeedImpl(seed) {
-  const trimmed = (seed || '').toString();
-  if (!trimmed) return { found: false, reason: "seed vazio." };
-  let hash = 0;
-  for (let i = 0; i < trimmed.length; i++) { hash = trimmed.charCodeAt(i) + ((hash << 5) - hash); hash = hash & hash; }
-  const hue = Math.abs(hash) % 360;
-  return { found: true, seed: trimmed, hue, hsl: `hsl(${hue}, 70%, 55%)`, hsl_light: `hsl(${hue}, 70%, 90%)`, hsl_dark: `hsl(${hue}, 60%, 35%)` };
-}
-
-async function generateLetterCardSvgImpl(letterOrSyllable, hue, size) {
-  try {
-    if (!letterOrSyllable) return { found: false, reason: "letter_or_syllable vazio." };
-    const resolvedHue = typeof hue === 'number' ? hue : colorFromLetterSeedImpl(letterOrSyllable).hue;
-    const s = size || 300;
-    const bodyHtml = `<div style="display:flex; width:${s}px; height:${s}px; background:hsl(${resolvedHue}, 70%, 55%); border-radius:24px; align-items:center; justify-content:center; font-family:Inter;">
-      <div style="display:flex; font-size:${Math.round(s * 0.5)}px; font-weight:700; color:white;">${escapeHtml(letterOrSyllable)}</div>
-    </div>`;
-    const svg = await htmlToSvgViaSatori(bodyHtml, s, s);
-    const buffer = await svgToPngBuffer(svg);
-    return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: `Cartão: ${letterOrSyllable}`, hue: resolvedHue };
-  } catch (e) {
-    return { found: false, reason: `Erro ao gerar cartão de letra: ${e.message}` };
   }
 }
 
@@ -1226,44 +1431,91 @@ function generateColorSchemeImpl(baseColorHex) {
   }
 }
 
+// ── Avatar geométrico real: gerador determinístico de formas
+// orgânicas sobrepostas (círculos, blobs, triângulos) — substitui
+// o antigo grid de blocos, que ficava sempre "quadriculado" e feio.
+function seededRandomFactory(seedString) {
+  let hash = 0;
+  for (let i = 0; i < seedString.length; i++) { hash = seedString.charCodeAt(i) + ((hash << 5) - hash); hash = hash & hash; }
+  let state = Math.abs(hash) || 1;
+  return function next() {
+    state = (state * 9301 + 49297) % 233280;
+    return state / 233280;
+  };
+}
+
 async function generateRandomAvatarImpl(seed, size) {
   try {
     const trimmed = (seed || '').toString();
     if (!trimmed) return { found: false, reason: "seed vazio." };
+    const rand = seededRandomFactory(trimmed);
+    const s = size || 256;
+    const cx = s / 2, cy = s / 2;
+
     let hash = 0;
     for (let i = 0; i < trimmed.length; i++) { hash = trimmed.charCodeAt(i) + ((hash << 5) - hash); hash = hash & hash; }
-    const rand = (i) => { const x = Math.sin(hash + i) * 10000; return x - Math.floor(x); };
-    const hue = Math.abs(hash) % 360;
-    const s = size || 200;
-    const cell = s / 5;
-    let rects = '';
-    for (let row = 0; row < 5; row++) {
-      for (let col = 0; col < 3; col++) {
-        if (rand(row * 3 + col) > 0.5) {
-          const mirrorCol = 4 - col;
-          rects += `<rect x="${col * cell}" y="${row * cell}" width="${cell}" height="${cell}" fill="hsl(${hue},65%,55%)" />`;
-          if (mirrorCol !== col) rects += `<rect x="${mirrorCol * cell}" y="${row * cell}" width="${cell}" height="${cell}" fill="hsl(${hue},65%,55%)" />`;
+    const baseHue = Math.abs(hash) % 360;
+    const hueShift = 35 + Math.floor(rand() * 40);
+    const colorA = `hsl(${baseHue}, 68%, 58%)`;
+    const colorB = `hsl(${(baseHue + hueShift) % 360}, 70%, 62%)`;
+    const colorC = `hsl(${(baseHue + hueShift * 2) % 360}, 65%, 50%)`;
+
+    // fundo em gradiente suave
+    const bgId = 'bg' + Math.abs(hash);
+    let shapes = `<defs><linearGradient id="${bgId}" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="${colorA}" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="${colorB}" stop-opacity="0.28"/>
+    </linearGradient></defs>`;
+    shapes += `<rect width="${s}" height="${s}" fill="url(#${bgId})"/>`;
+
+    // 3 a 4 formas orgânicas sobrepostas, posições e tamanhos variam pela seed
+    const shapeCount = 3 + Math.floor(rand() * 2);
+    const colors = [colorA, colorB, colorC];
+    for (let i = 0; i < shapeCount; i++) {
+      const color = colors[i % colors.length];
+      const type = rand();
+      const angle = rand() * Math.PI * 2;
+      const dist = rand() * s * 0.22;
+      const ox = cx + Math.cos(angle) * dist;
+      const oy = cy + Math.sin(angle) * dist;
+      const r = s * (0.18 + rand() * 0.16);
+      const opacity = 0.55 + rand() * 0.35;
+
+      if (type < 0.45) {
+        // círculo
+        shapes += `<circle cx="${ox.toFixed(1)}" cy="${oy.toFixed(1)}" r="${r.toFixed(1)}" fill="${color}" opacity="${opacity.toFixed(2)}"/>`;
+      } else if (type < 0.75) {
+        // blob orgânico (polígono suavizado com pontos aleatórios em torno de um círculo)
+        const points = 6;
+        let path = '';
+        const coords = [];
+        for (let p = 0; p < points; p++) {
+          const pa = (p / points) * Math.PI * 2;
+          const pr = r * (0.75 + rand() * 0.5);
+          coords.push([ox + Math.cos(pa) * pr, oy + Math.sin(pa) * pr]);
         }
+        path += `M ${coords[0][0].toFixed(1)} ${coords[0][1].toFixed(1)} `;
+        for (let p = 0; p < points; p++) {
+          const next = coords[(p + 1) % points];
+          const curr = coords[p];
+          const mx = (curr[0] + next[0]) / 2, my = (curr[1] + next[1]) / 2;
+          path += `Q ${curr[0].toFixed(1)} ${curr[1].toFixed(1)} ${mx.toFixed(1)} ${my.toFixed(1)} `;
+        }
+        path += 'Z';
+        shapes += `<path d="${path}" fill="${color}" opacity="${opacity.toFixed(2)}"/>`;
+      } else {
+        // triângulo rotacionado
+        const rot = rand() * 360;
+        shapes += `<polygon points="${ox},${(oy - r).toFixed(1)} ${(ox + r * 0.87).toFixed(1)},${(oy + r * 0.5).toFixed(1)} ${(ox - r * 0.87).toFixed(1)},${(oy + r * 0.5).toFixed(1)}" fill="${color}" opacity="${opacity.toFixed(2)}" transform="rotate(${rot.toFixed(1)} ${ox.toFixed(1)} ${oy.toFixed(1)})"/>`;
       }
     }
-    const svgContent = `<svg width="${s}" height="${s}" viewBox="0 0 ${s} ${s}" xmlns="http://www.w3.org/2000/svg"><rect width="${s}" height="${s}" fill="#F1F5F9"/>${rects}</svg>`;
+
+    const svgContent = `<svg width="${s}" height="${s}" viewBox="0 0 ${s} ${s}" xmlns="http://www.w3.org/2000/svg">${shapes}</svg>`;
     const buffer = await sharp(Buffer.from(svgContent)).png().toBuffer();
-    return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: `Avatar: ${trimmed}`, hue };
+    return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: `Avatar: ${trimmed}` };
   } catch (e) {
     return { found: false, reason: `Erro ao gerar avatar: ${e.message}` };
   }
-}
-
-function generateMemoryGameGridImpl(items, columns) {
-  if (!items || items.length === 0) return { found: false, reason: "items vazio." };
-  const pairs = items.flatMap(item => [item, item]);
-  for (let i = pairs.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [pairs[i], pairs[j]] = [pairs[j], pairs[i]];
-  }
-  const cols = columns || Math.ceil(Math.sqrt(pairs.length));
-  const grid = pairs.map((item, i) => ({ item, position: i, row: Math.floor(i / cols), col: i % cols }));
-  return { found: true, total_cards: pairs.length, columns: cols, rows: Math.ceil(pairs.length / cols), grid };
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1454,7 +1706,6 @@ async function htmlToPptxImpl(htmlContent, title) {
 }
 
 async function docxToHtmlImpl(docxBase64) {
-  if (!mammoth) return { found: false, reason: "Lib 'mammoth' não instalada — adiciona ao package.json e faz npm install." };
   try {
     if (!docxBase64) return { found: false, reason: "docx_base64 vazio." };
     const buffer = Buffer.from(docxBase64, 'base64');
@@ -1543,7 +1794,7 @@ async function watermarkImageImpl(imageBase64, watermarkText, position) {
     const align = pos.includes('left') ? 'flex-start' : pos.includes('right') ? 'flex-end' : 'center';
     const justify = pos.includes('top') ? 'flex-start' : pos.includes('bottom') ? 'flex-end' : 'center';
     const overlayHtml = `<div style="display:flex; width:${meta.width}px; height:${meta.height}px; align-items:${justify}; justify-content:${align}; padding:20px;">
-      <div style="display:flex; background:rgba(0,0,0,0.45); color:white; padding:6px 12px; border-radius:6px; font-size:${Math.max(12, Math.round(meta.width / 40))}px; font-family:Inter;">${escapeHtml(watermarkText)}</div>
+      <div style="display:flex; background:rgba(15,23,42,0.55); color:white; padding:7px 14px; border-radius:8px; font-size:${Math.max(12, Math.round(meta.width / 40))}px; font-family:Inter;">${escapeHtml(watermarkText)}</div>
     </div>`;
     const svg = await htmlToSvgViaSatori(overlayHtml, meta.width, meta.height);
     const overlayBuffer = await svgToPngBuffer(svg);
@@ -1566,7 +1817,6 @@ async function imageMetadataImpl(imageBase64) {
 }
 
 async function vectorizeImageImpl(imageBase64, mode) {
-  if (!potrace) return { found: false, reason: "Lib 'potrace' não instalada — adiciona ao package.json e faz npm install." };
   try {
     if (!imageBase64) return { found: false, reason: "image_base64 vazio." };
     const buffer = Buffer.from(imageBase64, 'base64');
@@ -1590,7 +1840,6 @@ async function vectorizeImageImpl(imageBase64, mode) {
 }
 
 async function ocrExtractTextImpl(imageBase64, language) {
-  if (!Tesseract) return { found: false, reason: "Lib 'tesseract.js' não instalada — adiciona ao package.json e faz npm install." };
   try {
     if (!imageBase64) return { found: false, reason: "image_base64 vazio." };
     const buffer = Buffer.from(imageBase64, 'base64');
@@ -1608,8 +1857,8 @@ async function pdfToImagesImpl(pdfBase64, maxPages) {
     const buffer = Buffer.from(pdfBase64, 'base64');
     const data = await pdfParse(buffer);
     const firstPageText = data.text.split('\f')[0] || data.text.slice(0, 1500);
-    const escapedLines = escapeHtml(firstPageText.slice(0, 1200)).split('\n').slice(0, 30).map(l => `<div style="display:flex; font-size:11px; color:#333; padding-bottom:2px;">${l || '&nbsp;'}</div>`).join('');
-    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:24px; background:white; font-family:Inter;">${escapedLines}</div>`;
+    const escapedLines = escapeHtml(firstPageText.slice(0, 1200)).split('\n').slice(0, 30).map(l => `<div style="display:flex; font-size:11px; color:${DESIGN.inkSoft}; padding-bottom:2px;">${l || '&nbsp;'}</div>`).join('');
+    const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:32px; background:white; font-family:Inter;">${escapedLines}</div>`;
     const svg = await htmlToSvgViaSatori(bodyHtml, A4_WIDTH_PX, A4_HEIGHT_PX);
     const pngBuffer = await svgToPngBuffer(svg);
     return {
@@ -1637,7 +1886,7 @@ async function pptxToImagesImpl(pptxBase64) {
       const xml = slideEntries[i].getData().toString('utf8');
       const textMatches = xml.match(/<a:t>([^<]*)<\/a:t>/g) || [];
       const texts = textMatches.map(m => m.replace(/<a:t>|<\/a:t>/g, '')).filter(Boolean);
-      const linesHtml = texts.slice(0, 12).map((t, idx) => `<div style="display:flex; font-size:${idx === 0 ? 22 : 14}px; font-weight:${idx === 0 ? 700 : 400}; color:#1a1a1a; padding-bottom:8px;">${escapeHtml(t)}</div>`).join('');
+      const linesHtml = texts.slice(0, 12).map((t, idx) => `<div style="display:flex; font-size:${idx === 0 ? 22 : 14}px; font-weight:${idx === 0 ? 700 : 400}; color:${DESIGN.ink}; padding-bottom:8px;">${escapeHtml(t)}</div>`).join('');
       const bodyHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:32px; background:white; font-family:Inter;">${linesHtml}</div>`;
       try {
         const svg = await htmlToSvgViaSatori(bodyHtml, 960, 540);
@@ -1652,14 +1901,32 @@ async function pptxToImagesImpl(pptxBase64) {
 }
 
 async function audioDurationCheckImpl(audioBase64) {
-  if (!musicMetadata) return { found: false, reason: "Lib 'music-metadata' não instalada — adiciona ao package.json e faz npm install." };
   try {
     if (!audioBase64) return { found: false, reason: "audio_base64 vazio." };
     const buffer = Buffer.from(audioBase64, 'base64');
     const metadata = await musicMetadata.parseBuffer(buffer);
-    return { found: true, duration_seconds: metadata.format.duration || null, format: metadata.format.container || null, sample_rate: metadata.format.sampleRate || null, bitrate: metadata.format.bitrate || null };
+    const common = metadata.common || {};
+    const format = metadata.format || {};
+    return {
+      found: true,
+      duration_seconds: format.duration || null,
+      duration_formatted: format.duration ? `${Math.floor(format.duration / 60)}:${String(Math.round(format.duration % 60)).padStart(2, '0')}` : null,
+      title: common.title || null,
+      artist: common.artist || null,
+      album: common.album || null,
+      year: common.year || null,
+      genre: (common.genre || []).join(', ') || null,
+      track_number: common.track && common.track.no ? common.track.no : null,
+      format: format.container || null,
+      codec: format.codec || null,
+      sample_rate_hz: format.sampleRate || null,
+      bitrate_kbps: format.bitrate ? Math.round(format.bitrate / 1000) : null,
+      channels: format.numberOfChannels || null,
+      has_embedded_cover: !!(common.picture && common.picture.length > 0),
+      size_bytes: buffer.length,
+    };
   } catch (e) {
-    return { found: false, reason: `Erro ao ler duração de áudio: ${e.message}` };
+    return { found: false, reason: `Erro ao ler metadados de áudio: ${e.message}` };
   }
 }
 
@@ -1701,13 +1968,13 @@ function extractUrlsFromTextImpl(text) {
 
 function formatMarkdownToHtmlImpl(markdown) {
   if (!markdown) return { found: false, reason: "markdown vazio." };
-  let html = escapeHtml(markdown);
-  html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>').replace(/^## (.*$)/gim, '<h2>$1</h2>').replace(/^# (.*$)/gim, '<h1>$1</h1>');
-  html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\*(.*?)\*/g, '<em>$1</em>');
-  html = html.replace(/^\- (.*$)/gim, '<li>$1</li>');
-  html = html.replace(/(<li>.*<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`);
-  html = html.split('\n\n').map(p => p.trim().startsWith('<h') || p.trim().startsWith('<ul') ? p : `<p>${p}</p>`).join('\n');
-  return { found: true, html };
+  let htmlOut = escapeHtml(markdown);
+  htmlOut = htmlOut.replace(/^### (.*$)/gim, '<h3>$1</h3>').replace(/^## (.*$)/gim, '<h2>$1</h2>').replace(/^# (.*$)/gim, '<h1>$1</h1>');
+  htmlOut = htmlOut.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\*(.*?)\*/g, '<em>$1</em>');
+  htmlOut = htmlOut.replace(/^\- (.*$)/gim, '<li>$1</li>');
+  htmlOut = htmlOut.replace(/(<li>.*<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`);
+  htmlOut = htmlOut.split('\n\n').map(p => p.trim().startsWith('<h') || p.trim().startsWith('<ul') ? p : `<p>${p}</p>`).join('\n');
+  return { found: true, html: htmlOut };
 }
 
 function countTokensEstimateImpl(text) {
@@ -1725,26 +1992,6 @@ function textSummaryStatsImpl(text) {
   return { found: true, word_count: words, sentence_count: sentences, paragraph_count: paragraphs, estimated_reading_time_minutes: readingTimeMin };
 }
 
-function textToSyllablesPtImpl(word) {
-  if (!word) return { found: false, reason: "word vazio." };
-  const trimmed = word.trim().toLowerCase();
-  const vowels = 'aeiouáéíóúâêôãõ';
-  const syllables = [];
-  let current = '';
-  for (let i = 0; i < trimmed.length; i++) {
-    const c = trimmed[i];
-    current += c;
-    const isVowel = vowels.includes(c);
-    const nextIsVowel = i + 1 < trimmed.length && vowels.includes(trimmed[i + 1]);
-    const nextNextIsVowel = i + 2 < trimmed.length && vowels.includes(trimmed[i + 2]);
-    if (isVowel && !nextIsVowel && i + 1 < trimmed.length) {
-      if (nextNextIsVowel || i + 2 >= trimmed.length) { syllables.push(current); current = ''; }
-    }
-  }
-  if (current) syllables.push(current);
-  return { found: true, word: trimmed, syllables: syllables.length > 0 ? syllables : [trimmed], note: "Heurística de regras comuns — não cobre 100% dos casos irregulares do português." };
-}
-
 async function youtubeThumbnailExtractImpl(youtubeUrl) {
   try {
     if (!youtubeUrl) return { found: false, reason: "youtube_url vazio." };
@@ -1758,7 +2005,6 @@ async function youtubeThumbnailExtractImpl(youtubeUrl) {
 }
 
 async function mergePdfsImpl(pdfsBase64) {
-  if (!pdfLib) return { found: false, reason: "Lib 'pdf-lib' não instalada — adiciona ao package.json e faz npm install." };
   try {
     if (!pdfsBase64 || pdfsBase64.length < 2) return { found: false, reason: "Fornece pelo menos 2 PDFs em pdfs_base64." };
     const merged = await pdfLib.PDFDocument.create();
@@ -1775,7 +2021,6 @@ async function mergePdfsImpl(pdfsBase64) {
 }
 
 async function splitPdfPagesImpl(pdfBase64, pageNumbers) {
-  if (!pdfLib) return { found: false, reason: "Lib 'pdf-lib' não instalada — adiciona ao package.json e faz npm install." };
   try {
     if (!pdfBase64) return { found: false, reason: "pdf_base64 vazio." };
     if (!pageNumbers || pageNumbers.length === 0) return { found: false, reason: "page_numbers vazio." };
@@ -1794,8 +2039,7 @@ async function splitPdfPagesImpl(pdfBase64, pageNumbers) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// CLASSIFICAÇÃO DAS TOOLS — para runTool() saber tratar erro
-// de forma consistente e para o Flutter classificar cards
+// CLASSIFICAÇÃO DAS TOOLS PESADAS — bloqueadas sem ENABLE_HEAVY_TOOLS
 // ═══════════════════════════════════════════════════════════
 const HEAVY_TOOL_NAMES = new Set(['animate_html', 'generate_infographic']);
 
@@ -1812,8 +2056,10 @@ async function runTool(name, input) {
   switch (name) {
     // Busca / dados externos
     case "web_search": return await webSearchImpl(input.query);
-    case "search_images": return await searchImagesImpl(input.query);
-    case "search_videos": return await searchVideosImpl(input.query);
+    case "read_website": return await readWebsiteImpl(input.url);
+    case "search_images": return await searchImagesImpl(input.query, input.max_results);
+    case "search_videos": return await searchVideosImpl(input.query, input.max_results);
+    case "search_books": return await searchBooksImpl(input.query, input.max_results);
     case "download_image_for_project": return await downloadImageForProjectImpl(input.query_or_url, input.target_filename);
     case "search_market": return await searchMarketImpl(input.query);
     case "search_place": return await searchPlaceImpl(input.query);
@@ -1823,20 +2069,18 @@ async function runTool(name, input) {
     // Geração de imagem
     case "generate_chart": return await generateChartImpl(input.chart_type, input.title, input.labels, input.datasets);
     case "generate_function_plot": return await generateFunctionPlotImpl(input.expression, input.x_min, input.x_max, input.title, input.highlight_roots);
+    case "generate_math_sheet": return await enqueueHeavy(withTimeout(() => generateMathSheetImpl(input.expression, input.show_graph)));
     case "generate_mindmap": return await generateMindmapImpl(input.root);
     case "generate_qrcode": return await generateQrcodeImpl(input.content, input.size);
     case "generate_barcode": return await generateBarcodeImpl(input.content, input.format);
-    case "generate_math": return await generateMathImpl(input.expression);
     case "generate_table_image": return await generateTableImageImpl(input.title, input.headers, input.rows);
     case "generate_html_image": return await enqueueHeavy(withTimeout(() => generateHtmlImageImpl(input.html, input.width, input.height)));
-    case "generate_letter_card_svg": return await generateLetterCardSvgImpl(input.letter_or_syllable, input.hue, input.size);
     case "generate_color_scheme": return generateColorSchemeImpl(input.base_color_hex);
     case "generate_random_avatar": return await generateRandomAvatarImpl(input.seed, input.size);
-    case "generate_memory_game_grid": return generateMemoryGameGridImpl(input.items, input.columns);
 
     // Documentos
     case "create_pdf": return await enqueueHeavy(withTimeout(() => createPdfImpl(input.title, input.html_content, input.image_urls, input.embed_chart)));
-    case "create_pdf_structured": return await enqueueHeavy(withTimeout(() => createPdfStructuredImpl(input.title, input.sections)));
+    case "create_pdf_structured": return await enqueueHeavy(withTimeout(() => createPdfStructuredImpl(input.title, input.subtitle, input.sections)));
     case "create_docx": return await enqueueHeavy(withTimeout(() => createDocxImpl(input.title, input.html_content, input.image_urls, input.embed_chart)));
     case "create_xlsx": return await createXlsxImpl(input.sheet_name, input.headers, input.rows);
     case "create_pptx": return await createPptxImpl(input.title, input.slides);
@@ -1877,13 +2121,11 @@ async function runTool(name, input) {
     case "format_markdown_to_html": return formatMarkdownToHtmlImpl(input.markdown);
     case "count_tokens_estimate": return countTokensEstimateImpl(input.text);
     case "text_summary_stats": return textSummaryStatsImpl(input.text);
-    case "text_to_syllables_pt": return textToSyllablesPtImpl(input.word);
-    case "color_from_letter_seed": return colorFromLetterSeedImpl(input.seed);
     case "youtube_thumbnail_extract": return await youtubeThumbnailExtractImpl(input.youtube_url);
     case "merge_pdfs": return await mergePdfsImpl(input.pdfs_base64);
     case "split_pdf_pages": return await splitPdfPagesImpl(input.pdf_base64, input.page_numbers);
 
-    // Heavy tools (bloqueadas por defeito, ver check no topo)
+    // Heavy tools (bloqueadas por defeito — ver check no topo)
     case "animate_html": return { found: false, reason: "animate_html requer motor de vídeo — indisponível neste servidor mesmo com ENABLE_HEAVY_TOOLS." };
     case "generate_infographic": return { found: false, reason: "generate_infographic ainda não implementada nesta versão." };
 
@@ -1896,7 +2138,7 @@ async function runTool(name, input) {
 // ENDPOINTS
 // ═══════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'nexa-tools-api', version: '2.1.0', tools_count: tools.length, date: getCurrentDateInfo().full });
+  res.json({ status: 'ok', service: 'nexa-tools-api', version: '2.2.0', tools_count: tools.length, date: getCurrentDateInfo().full });
 });
 
 app.get('/tools', (req, res) => {
@@ -1915,15 +2157,8 @@ app.post('/run-tool', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════
-// ALIAS — /tools/execute aponta para o mesmo runTool() que
-// /run-tool. O worker Cloudflare (handleToolsExecute) chama
-// TOOLS_SERVER_BASE + "/tools/execute" — essa rota nunca existiu
-// aqui depois da reescrita das 61 tools, por isso o worker
-// recebia 404 em HTML do Express e rebentava no res.json() com
-// "Unexpected token '<'". Mesma lógica do /run-tool, nome
-// diferente, sem duplicar código.
-// ═══════════════════════════════════════════════════════════
+// Alias — mesmo runTool() que /run-tool, nome diferente exigido
+// por alguns workers/clientes que apontam para /tools/execute.
 app.post('/tools/execute', async (req, res) => {
   const { name, input } = req.body || {};
   if (!name) return res.status(400).json({ found: false, reason: "Campo 'name' é obrigatório." });
