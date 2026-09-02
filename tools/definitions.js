@@ -70,19 +70,32 @@ const tools = [
   // ENVIO DE EMAIL
   // ─────────────────────────────────────────────────────────
   {
-    name: "send_email",
-    description: "Envia um email real para um destinatário específico via Resend. Usa sempre que o utilizador pedir para enviar, mandar ou notificar por email. O campo 'content' aceita HTML (recomendado) para formatação, mas texto simples também funciona.",
-    input_schema: {
-      type: "object",
-      properties: {
-        to: { type: "string", description: "Endereço de email do destinatário." },
-        subject: { type: "string", description: "Assunto do email." },
-        content: { type: "string", description: "Corpo do email. Pode ser HTML (ex: <p>...</p>) ou texto simples." },
-        from_name: { type: "string", description: "Nome do remetente a mostrar (opcional, ex: 'Nexa'). Se omitido, usa apenas o endereço de email configurado no servidor." }
-      },
-      required: ["to", "subject", "content"]
-    }
-  },
+  name: "send_email",
+  description: "Envia um email real para um destinatário específico via Resend. Usa sempre que o utilizador pedir para enviar, mandar ou notificar por email. O campo 'content' aceita HTML completo (recomendado, com CSS inline) para formatação rica, mas texto simples também funciona. Para incluir imagens dentro do corpo do email, usa o campo 'images': cada imagem vai como anexo embutido, e deve ser referenciada no HTML com <img src=\"cid:O_CONTENT_ID_ESCOLHIDO\">, onde O_CONTENT_ID_ESCOLHIDO tem de ser exatamente igual ao content_id que puseste nesse item de 'images'. Nota: imagens em base64 direto no <img src> NÃO funcionam no Gmail/Outlook — usa sempre o mecanismo de 'images'+cid.",
+  input_schema: {
+    type: "object",
+    properties: {
+      to: { type: "string", description: "Endereço de email do destinatário." },
+      subject: { type: "string", description: "Assunto do email." },
+      content: { type: "string", description: "Corpo do email em HTML (recomendado, com CSS inline para estilos) ou texto simples. Para imagens embutidas, referencia via <img src=\"cid:...\">." },
+      from_name: { type: "string", description: "Nome do remetente a mostrar (opcional, ex: 'Nexa'). Se omitido, usa apenas o endereço de email configurado no servidor." },
+      images: {
+        type: "array",
+        description: "Opcional. Imagens a embutir no corpo do email via CID. Cada uma tem de ser referenciada no 'content' como <img src=\"cid:content_id\">.",
+        items: {
+          type: "object",
+          properties: {
+            content_base64: { type: "string", description: "Imagem em base64 (sem prefixo data:...;base64,)." },
+            content_id: { type: "string", description: "Identificador único desta imagem, usado no HTML como cid:esse_id (ex: 'logo1')." },
+            filename: { type: "string", description: "Nome do ficheiro (opcional, ex: 'logo.png')." }
+          },
+          required: ["content_base64", "content_id"]
+        }
+      }
+    },
+    required: ["to", "subject", "content"]
+  }
+},
 
   // ─────────────────────────────────────────────────────────
   // GERAÇÃO DE IMAGEM

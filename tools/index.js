@@ -37,7 +37,7 @@ async function runTool(name, input) {
     case "get_weather": return await search.getWeatherImpl(input.city);
 
     // Envio de email
-    case "send_email": return await email.sendEmailImpl(input.to, input.subject, input.content, input.from_name);
+    case "send_email": return await email.sendEmailImpl(input.to, input.subject, input.content, input.from_name, input.images);
 
     // Geração de imagem
     case "generate_chart": return await imageGeneration.generateChartImpl(input.chart_type, input.title, input.labels, input.datasets);
