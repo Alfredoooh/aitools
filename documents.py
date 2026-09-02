@@ -373,7 +373,7 @@ def montar_qrcode(spec):
 def montar_barcode128(spec):
     barcode = code128.Code128(spec.get("content", ""), barHeight=spec.get("height", 15) * 1.0, barWidth=spec.get("bar_width", 0.7))
     drawing = Drawing(barcode.width, barcode.height + 10)
-    drawing.add(barcode)
+    drawing.add(barcode.draw())
     return drawing
 
 
