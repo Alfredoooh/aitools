@@ -3,10 +3,12 @@ services:
     name: nexa-tools-api
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install && pip install -r requirements.txt --break-system-packages
     startCommand: npm start
     envVars:
       - key: SERPER_API_KEY
         sync: false
       - key: NODE_VERSION
         value: 22.22.2
+      - key: PYTHON_VERSION
+        value: 3.11.9
