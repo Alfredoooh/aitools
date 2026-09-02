@@ -149,8 +149,11 @@ def desenhar_faixa_lateral(canvas_obj, doc, cor_hex, largura_pt=14):
     canvas_obj.restoreState()
 
 
-def rodape_e_extras_pagina(header_text, watermark, footer_spec=None, faixa_lateral_hex=None, header_cor_hex=None):
+def rodape_e_extras_pagina(header_text, watermark, footer_spec=None, faixa_lateral_hex=None, header_cor_hex=None, capa_spec=None):
     def _draw(canvas_obj, doc):
+        if capa_spec and doc.page == 1:
+            desenhar_fundo_capa(canvas_obj, doc, capa_spec)
+            return
         if watermark:
             desenhar_marca_dagua(canvas_obj, doc, watermark)
         if faixa_lateral_hex:
@@ -515,25 +518,40 @@ def montar_badge_lista(items_spec):
 
 
 def montar_capa(capa_spec, s):
-    """Página de capa full-bleed com fundo colorido/gradiente simulado,
-    título, subtítulo e rodapé — usa Drawing como fundo atrás do texto."""
-    largura, altura = A4
-    cor_fundo = colors.HexColor(capa_spec.get("bg", "#0F172A"))
-    itens = []
-    drawing = Drawing(largura, altura)
-    drawing.add(Rect(0, 0, largura, altura, fillColor=cor_fundo, strokeColor=None))
-    if capa_spec.get("accent_color"):
-        drawing.add(Rect(0, altura / 2 - 2, largura, 4, fillColor=colors.HexColor(capa_spec["accent_color"]), strokeColor=None))
-    itens.append(drawing)
-    itens.append(Spacer(1, -altura / 2 - 40))
-    itens.append(Paragraph(capa_spec.get("title", ""), s["capa_titulo"]))
+    """Página de capa full-bleed. NÃO usa Drawing como flowable —
+    um Drawing do tamanho da página inteira rebenta qualquer Frame
+    (que é sempre menor que a página por causa das margens). Em vez
+    disso, devolve só os itens de TEXTO da capa (que a Frame absorve
+    normalmente) e um dict de instrução para o onPage desenhar o
+    fundo colorido diretamente no canvas, ANTES do texto ser
+    posicionado por cima."""
+    itens = [Spacer(1, 220)]
+    p_titulo = Paragraph(capa_spec.get("title", ""), s["capa_titulo"])
+    p_titulo._is_cover_flow = True
+    itens.append(p_titulo)
     if capa_spec.get("subtitle"):
-        itens.append(Paragraph(capa_spec["subtitle"], s["capa_subtitulo"]))
+        p_sub = Paragraph(capa_spec["subtitle"], s["capa_subtitulo"])
+        p_sub._is_cover_flow = True
+        itens.append(p_sub)
     if capa_spec.get("footer"):
-        itens.append(Spacer(1, 60))
-        itens.append(Paragraph(capa_spec["footer"], s["capa_rodape"]))
+        itens.append(Spacer(1, 340))
+        p_rodape = Paragraph(capa_spec["footer"], s["capa_rodape"])
+        p_rodape._is_cover_flow = True
+        itens.append(p_rodape)
     itens.append(PageBreak())
     return itens
+
+
+def desenhar_fundo_capa(canvas_obj, doc, capa_spec):
+    canvas_obj.saveState()
+    largura, altura = doc.pagesize
+    cor_fundo = colors.HexColor(capa_spec.get("bg", "#0F172A"))
+    canvas_obj.setFillColor(cor_fundo)
+    canvas_obj.rect(0, 0, largura, altura, fill=1, stroke=0)
+    if capa_spec.get("accent_color"):
+        canvas_obj.setFillColor(colors.HexColor(capa_spec["accent_color"]))
+        canvas_obj.rect(0, altura / 2 - 2, largura, 4, fill=1, stroke=0)
+    canvas_obj.restoreState()
 
 
 def montar_story_secao(sec, s):
@@ -718,7 +736,7 @@ def create_pdf(params):
             header_text = sec["header_text"]
             break
 
-    on_page = rodape_e_extras_pagina(header_text, watermark, footer_spec, faixa_lateral_hex, header_cor_hex)
+    on_page = rodape_e_extras_pagina(header_text, watermark, footer_spec, faixa_lateral_hex, header_cor_hex, capa_spec)
 
     buffer = io.BytesIO()
     top_margin = 2.6 * cm if header_text else 2.2 * cm
