@@ -4,36 +4,12 @@
 
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
-const potrace = require('potrace');
-const { VECTORIZE_MAX_DIMENSION } = require('../config');
-const { escapeHtml, fetchImageAsBase64 } = require('../helpers');
-const { htmlToSvgViaSatori } = require('../satori-helpers');
+const { fetchImageAsBase64 } = require('../helpers');
 
 async function resolveImageBuffer(imageBase64, imageUrl) {
   if (imageBase64) return Buffer.from(imageBase64, 'base64');
   if (imageUrl) { const { buffer } = await fetchImageAsBase64(imageUrl); return buffer; }
   throw new Error('Fornece image_base64 ou image_url.');
-}
-
-async function getImageColorsImpl(imageUrl, imageBase64, numColors) {
-  try {
-    const buffer = await resolveImageBuffer(imageBase64, imageUrl);
-    const n = Math.min(Math.max(numColors || 5, 1), 10);
-    const { data, info } = await sharp(buffer).resize(50, 50, { fit: 'inside' }).raw().toBuffer({ resolveWithObject: true });
-    const channels = info.channels;
-    const counts = new Map();
-    for (let i = 0; i < data.length; i += channels) {
-      const r = Math.round(data[i] / 32) * 32, g = Math.round(data[i + 1] / 32) * 32, b = Math.round(data[i + 2] / 32) * 32;
-      const key = `${r},${g},${b}`;
-      counts.set(key, (counts.get(key) || 0) + 1);
-    }
-    const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, n);
-    const toHex = (v) => Math.min(255, v).toString(16).padStart(2, '0');
-    const colors = sorted.map(([key]) => { const [r, g, b] = key.split(',').map(Number); return `#${toHex(r)}${toHex(g)}${toHex(b)}`; });
-    return { found: true, dominant_colors: colors };
-  } catch (e) {
-    return { found: false, reason: `Erro ao extrair cores: ${e.message}` };
-  }
 }
 
 async function convertImageFormatImpl(imageBase64, targetFormat) {
@@ -74,59 +50,50 @@ async function cropImageImpl(imageBase64, left, top, width, height) {
   }
 }
 
+/**
+ * Marca d'água desenhada via sharp SVG nativo (sem satori) —
+ * sharp aceita um buffer SVG como input de composite diretamente.
+ */
 async function watermarkImageImpl(imageBase64, watermarkText, position) {
   try {
     if (!imageBase64) return { found: false, reason: "image_base64 vazio." };
     if (!watermarkText) return { found: false, reason: "watermark_text vazio." };
     const baseBuffer = Buffer.from(imageBase64, 'base64');
     const meta = await sharp(baseBuffer).metadata();
+    const w = meta.width || 800;
+    const h = meta.height || 600;
     const pos = position || 'bottom-right';
-    const align = pos.includes('left') ? 'flex-start' : pos.includes('right') ? 'flex-end' : 'center';
-    const justify = pos.includes('top') ? 'flex-start' : pos.includes('bottom') ? 'flex-end' : 'center';
-    const overlayHtml = `<div style="display:flex; width:${meta.width}px; height:${meta.height}px; align-items:${justify}; justify-content:${align}; padding:20px;">
-      <div style="display:flex; background:rgba(15,23,42,0.55); color:white; padding:7px 14px; border-radius:8px; font-size:${Math.max(12, Math.round(meta.width / 40))}px; font-family:Inter;">${escapeHtml(watermarkText)}</div>
-    </div>`;
-    const { svgToPngBuffer } = require('../satori-helpers');
-    const svg = await htmlToSvgViaSatori(overlayHtml, meta.width, meta.height);
-    const overlayBuffer = await svgToPngBuffer(svg);
-    const buffer = await sharp(baseBuffer).composite([{ input: overlayBuffer, top: 0, left: 0 }]).png().toBuffer();
+    
+    const fontSize = Math.max(12, Math.round(w / 40));
+    const paddingBox = 20;
+    const textWidthEstimate = watermarkText.length * fontSize * 0.6 + 28;
+    const boxHeight = fontSize + 20;
+    
+    let boxX, boxY;
+    if (pos.includes('left')) boxX = paddingBox;
+    else if (pos.includes('right')) boxX = w - textWidthEstimate - paddingBox;
+    else boxX = (w - textWidthEstimate) / 2;
+    
+    if (pos.includes('top')) boxY = paddingBox;
+    else if (pos.includes('bottom')) boxY = h - boxHeight - paddingBox;
+    else boxY = (h - boxHeight) / 2;
+    
+    const escapedText = watermarkText
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    
+    const svgOverlay = `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+      <rect x="${boxX}" y="${boxY}" width="${textWidthEstimate}" height="${boxHeight}" rx="8" ry="8" fill="rgba(15,23,42,0.55)" />
+      <text x="${boxX + 14}" y="${boxY + boxHeight / 2 + fontSize / 3}" font-family="sans-serif" font-size="${fontSize}" fill="white">${escapedText}</text>
+    </svg>`;
+    
+    const buffer = await sharp(baseBuffer)
+      .composite([{ input: Buffer.from(svgOverlay), top: 0, left: 0 }])
+      .png()
+      .toBuffer();
+    
     return { found: true, content_base64: buffer.toString('base64'), mime_type: 'image/png', label: 'Imagem com marca d\'água' };
   } catch (e) {
     return { found: false, reason: `Erro ao aplicar marca d'água: ${e.message}` };
-  }
-}
-
-async function imageMetadataImpl(imageBase64) {
-  try {
-    if (!imageBase64) return { found: false, reason: "image_base64 vazio." };
-    const buffer = Buffer.from(imageBase64, 'base64');
-    const meta = await sharp(buffer).metadata();
-    return { found: true, format: meta.format, width: meta.width, height: meta.height, has_alpha: !!meta.hasAlpha, size_bytes: buffer.length, color_space: meta.space || null };
-  } catch (e) {
-    return { found: false, reason: `Erro ao ler metadados: ${e.message}` };
-  }
-}
-
-async function vectorizeImageImpl(imageBase64, mode) {
-  try {
-    if (!imageBase64) return { found: false, reason: "image_base64 vazio." };
-    const buffer = Buffer.from(imageBase64, 'base64');
-    const meta = await sharp(buffer).metadata();
-    if (Math.max(meta.width || 0, meta.height || 0) > VECTORIZE_MAX_DIMENSION) {
-      return { found: false, reason: `Imagem excede ${VECTORIZE_MAX_DIMENSION}px na maior dimensão — usa resize_image primeiro.` };
-    }
-    const pngBuffer = await sharp(buffer).png().toBuffer();
-    const svg = await new Promise((resolve, reject) => {
-      const TraceClass = mode === 'color' ? potrace.Posterizer : potrace.Potrace;
-      const tracer = new TraceClass();
-      tracer.loadImage(pngBuffer, (err) => {
-        if (err) return reject(err);
-        tracer.getSVG((err2, svgStr) => { if (err2) reject(err2); else resolve(svgStr); });
-      });
-    });
-    return { found: true, svg, label: `Vetorizado (${mode || 'black_transparent'})` };
-  } catch (e) {
-    return { found: false, reason: `Erro ao vetorizar imagem: ${e.message}` };
   }
 }
 
@@ -143,12 +110,9 @@ async function ocrExtractTextImpl(imageBase64, language) {
 }
 
 module.exports = {
-  getImageColorsImpl,
   convertImageFormatImpl,
   resizeImageImpl,
   cropImageImpl,
   watermarkImageImpl,
-  imageMetadataImpl,
-  vectorizeImageImpl,
   ocrExtractTextImpl,
 };

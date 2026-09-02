@@ -9,20 +9,21 @@ from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    HRFlowable, Image, PageBreak
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image
 )
-from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.graphics.shapes import Drawing, Rect, String
+from reportlab.graphics import renderPM
 
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-COR_PRIMARIA = colors.HexColor("#1A2B4C")
-COR_SECUNDARIA = colors.HexColor("#3E6B9E")
-COR_DESTAQUE = colors.HexColor("#E8A33D")
-COR_TEXTO = colors.HexColor("#2B2B2B")
-COR_CINZA_CLARO = colors.HexColor("#F2F4F7")
+COR_PRIMARIA = colors.HexColor("#0F172A")
+COR_SECUNDARIA = colors.HexColor("#4F46E5")
+COR_DESTAQUE = colors.HexColor("#F59E0B")
+COR_TEXTO = colors.HexColor("#475569")
+COR_CINZA_CLARO = colors.HexColor("#F8FAFC")
+PALETA = ["#4F46E5", "#0EA5E9", "#F59E0B", "#EF4444", "#10B981", "#8B5CF6", "#EC4899", "#14B8A6"]
 
 
 def get_styles():
@@ -90,22 +91,6 @@ def montar_tabela(headers, rows):
 
 
 def create_pdf_structured(params):
-    """
-    params = {
-      "title": str,
-      "subtitle": str (opcional),
-      "sections": [
-        {
-          "heading": str,
-          "paragraphs": [str, ...],
-          "bullet_list": [str, ...],
-          "image_url": str (opcional),
-          "table": {"headers": [...], "rows": [[...], ...]}
-        }
-      ]
-    }
-    Retorna: dict com "pdf_base64"
-    """
     s = get_styles()
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
@@ -121,20 +106,16 @@ def create_pdf_structured(params):
     for sec in params.get("sections", []):
         if sec.get("heading"):
             story.append(Paragraph(sec["heading"], s["heading"]))
-
         for p in sec.get("paragraphs", []):
             story.append(Paragraph(p, s["corpo"]))
-
         for item in sec.get("bullet_list", []):
             story.append(Paragraph(f"• {item}", s["bullet"]))
-
         if sec.get("image_url"):
             img = baixar_imagem(sec["image_url"])
             if img:
                 story.append(Spacer(1, 6))
                 story.append(img)
                 story.append(Spacer(1, 6))
-
         if sec.get("table"):
             t = sec["table"]
             story.append(Spacer(1, 6))
@@ -148,11 +129,6 @@ def create_pdf_structured(params):
 
 
 def create_pdf(params):
-    """
-    Versão simplificada: título + lista de parágrafos/bullets direto,
-    sem precisar estruturar em "sections". Internamente reaproveita
-    create_pdf_structured com uma única seção.
-    """
     secao = {
         "paragraphs": params.get("paragraphs", []),
         "bullet_list": params.get("bullet_list", []),
@@ -167,42 +143,21 @@ def create_pdf(params):
 
 
 def create_docx(params):
-    """
-    params = {
-      "title": str,
-      "subtitle": str (opcional),
-      "sections": [
-        {
-          "heading": str,
-          "paragraphs": [str, ...],
-          "bullet_list": [str, ...],
-          "image_url": str (opcional),
-          "table": {"headers": [...], "rows": [[...], ...]}
-        }
-      ]
-    }
-    Retorna: dict com "docx_base64"
-    """
     document = Document()
-
-    titulo = document.add_heading(params["title"], level=0)
-    titulo.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    document.add_heading(params["title"], level=0)
 
     if params.get("subtitle"):
         sub = document.add_paragraph(params["subtitle"])
         sub.runs[0].font.size = Pt(13)
-        sub.runs[0].font.color.rgb = RGBColor(0x3E, 0x6B, 0x9E)
+        sub.runs[0].font.color.rgb = RGBColor(0x4F, 0x46, 0xE5)
 
     for sec in params.get("sections", []):
         if sec.get("heading"):
             document.add_heading(sec["heading"], level=1)
-
         for p in sec.get("paragraphs", []):
             document.add_paragraph(p)
-
         for item in sec.get("bullet_list", []):
             document.add_paragraph(item, style="List Bullet")
-
         if sec.get("image_url"):
             try:
                 resp = requests.get(sec["image_url"], timeout=8)
@@ -210,7 +165,6 @@ def create_docx(params):
                 document.add_picture(io.BytesIO(resp.content), width=Cm(14))
             except Exception:
                 pass
-
         if sec.get("table"):
             t = sec["table"]
             tabela = document.add_table(rows=1, cols=len(t["headers"]))
@@ -230,40 +184,38 @@ def create_docx(params):
     return {"docx_base64": base64.b64encode(docx_bytes).decode("utf-8")}
 
 
-def merge_pdfs(params):
-    from pypdf import PdfReader, PdfWriter
-    writer = PdfWriter()
-    for pdf_b64 in params["pdfs_base64"]:
-        reader = PdfReader(io.BytesIO(base64.b64decode(pdf_b64)))
-        for page in reader.pages:
-            writer.add_page(page)
-    buffer = io.BytesIO()
-    writer.write(buffer)
-    return {"pdf_base64": base64.b64encode(buffer.getvalue()).decode("utf-8")}
+def _draw_mindmap_node(drawing, node, x, y, depth, color_idx, max_width):
+    """Desenha recursivamente um nó do mapa mental e devolve a altura ocupada."""
+    label = node.get("label", "")
+    bg_color = colors.HexColor(PALETA[color_idx % len(PALETA)]) if depth > 0 else COR_PRIMARIA
+    box_width = min(max_width - x, 20 + len(label) * 6.5)
+    box_height = 22
+
+    rect = Rect(x, y - box_height, box_width, box_height, fillColor=bg_color, strokeColor=None, rx=6, ry=6)
+    drawing.add(rect)
+    text = String(x + 10, y - box_height + 7, label, fontSize=max(8, 12 - depth), fillColor=colors.white, fontName="Helvetica-Bold")
+    drawing.add(text)
+
+    current_y = y - box_height - 10
+    children = node.get("children", [])
+    for i, child in enumerate(children):
+        current_y = _draw_mindmap_node(drawing, child, x + 24, current_y, depth + 1, color_idx + i + 1, max_width)
+    return current_y
 
 
-def split_pdf_pages(params):
-    from pypdf import PdfReader, PdfWriter
-    reader = PdfReader(io.BytesIO(base64.b64decode(params["pdf_base64"])))
-    writer = PdfWriter()
-    for n in params["page_numbers"]:
-        writer.add_page(reader.pages[n - 1])
-    buffer = io.BytesIO()
-    writer.write(buffer)
-    return {"pdf_base64": base64.b64encode(buffer.getvalue()).decode("utf-8")}
+def generate_mindmap(params):
+    root = params["root"]
+    width, height = 960, 720
+    drawing = Drawing(width, height)
+    drawing.add(Rect(0, 0, width, height, fillColor=colors.white, strokeColor=None))
+    _draw_mindmap_node(drawing, root, 20, height - 20, 0, 0, width)
 
+    png_buffer = io.BytesIO()
+    renderPM.drawToFile(drawing, png_buffer, fmt="PNG")
+    png_bytes = png_buffer.getvalue()
+    png_buffer.close()
+    return {"png_base64": base64.b64encode(png_bytes).decode("utf-8")}
 
-def read_pdf_contents(params):
-    from pypdf import PdfReader
-    reader = PdfReader(io.BytesIO(base64.b64decode(params["pdf_base64"])))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return {"pages": pages, "page_count": len(pages)}
-
-
-# ───────────────────────────────────────────────────────────
-# Entry point — chamado via subprocess pelo Node (ver bridge.js)
-# Uso: python3 documents.py <nome_da_funcao> '<json_params>'
-# ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     func_name = sys.argv[1]
@@ -273,9 +225,7 @@ if __name__ == "__main__":
         "create_pdf": create_pdf,
         "create_pdf_structured": create_pdf_structured,
         "create_docx": create_docx,
-        "merge_pdfs": merge_pdfs,
-        "split_pdf_pages": split_pdf_pages,
-        "read_pdf_contents": read_pdf_contents,
+        "generate_mindmap": generate_mindmap,
     }
 
     if func_name not in funcoes:
