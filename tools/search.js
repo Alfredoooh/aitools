@@ -3,9 +3,9 @@
 // ═══════════════════════════════════════════════════════════
 
 const cheerio = require('cheerio');
+const { createCanvas } = require('canvas');
 const { SERPER_API_KEY, SERPER_MAX_RESULTS, WEBSITE_READ_MAX_CHARS, DESIGN } = require('../config');
-const { escapeHtml, fetchImageAsBase64 } = require('../helpers');
-const { htmlToSvgViaSatori, svgToPngBuffer } = require('../satori-helpers');
+const { fetchImageAsBase64 } = require('../helpers');
 
 async function webSearchImpl(query) {
   const trimmed = (query || '').trim();
@@ -198,40 +198,54 @@ async function searchMarketImpl(query) {
   }
 }
 
-async function searchPlaceImpl(query) {
-  const trimmed = (query || '').trim();
-  if (!trimmed) return { found: false, reason: "Query vazia" };
-  try {
-    const r = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(trimmed)}&format=json&limit=1`, {
-      headers: { 'User-Agent': 'nexa-tools-api/2.2.0' }, signal: AbortSignal.timeout(10000),
-    });
-    if (!r.ok) return { found: false, reason: `Nominatim devolveu ${r.status}` };
-    const data = await r.json();
-    if (!data || data.length === 0) return { found: false, reason: `Local "${trimmed}" não encontrado.` };
-    const place = data[0];
-    return { found: true, query: trimmed, name: place.display_name, latitude: parseFloat(place.lat), longitude: parseFloat(place.lon), type: place.type || null };
-  } catch (e) {
-    return { found: false, reason: `Erro na pesquisa de local: ${e.message}` };
-  }
-}
+/**
+ * Desenha o card de clima diretamente via canvas (sem satori/HTML).
+ */
+function drawWeatherCard(cityName, tempC, conditionLabel, humidity, windKmh) {
+  const width = 420;
+  const height = 280;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
 
-function searchCalendarDateImpl(query) {
-  const trimmed = (query || '').trim().toLowerCase();
-  if (!trimmed) return { found: false, reason: "Query vazia" };
-  const now = new Date();
-  const addDays = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
-  const toIso = (d) => d.toISOString().split('T')[0];
-  const map = {
-    'hoje': now, 'amanhã': addDays(now, 1), 'amanha': addDays(now, 1),
-    'ontem': addDays(now, -1), 'depois de amanhã': addDays(now, 2), 'depois de amanha': addDays(now, 2),
-    'daqui a uma semana': addDays(now, 7), 'próxima semana': addDays(now, 7), 'proxima semana': addDays(now, 7),
-  };
-  for (const key in map) {
-    if (trimmed.includes(key)) return { found: true, query: trimmed, resolved_date_iso: toIso(map[key]) };
-  }
-  const isoMatch = trimmed.match(/(\d{4})-(\d{2})-(\d{2})/);
-  if (isoMatch) return { found: true, query: trimmed, resolved_date_iso: isoMatch[0] };
-  return { found: false, reason: `Não consegui resolver a data "${trimmed}" — tenta formato ISO (AAAA-MM-DD) ou termos como "hoje"/"amanhã".` };
+  // Fundo gradiente
+  const gradient = ctx.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, '#4F46E5');
+  gradient.addColorStop(1, '#0EA5E9');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.textBaseline = 'alphabetic';
+
+  // Nome da cidade
+  ctx.font = 'bold 20px Sans';
+  ctx.fillText(cityName, 36, 60);
+
+  // Temperatura grande
+  ctx.font = 'bold 64px Sans';
+  ctx.fillText(`${Math.round(tempC)}°`, 36, 150);
+
+  // "C" ao lado
+  ctx.font = '20px Sans';
+  ctx.globalAlpha = 0.85;
+  const tempWidth = ctx.measureText(`${Math.round(tempC)}°`).width;
+  ctx.font = 'bold 64px Sans';
+  const tempWidthBold = ctx.measureText(`${Math.round(tempC)}°`).width;
+  ctx.font = '20px Sans';
+  ctx.fillText('C', 36 + tempWidthBold + 8, 150);
+  ctx.globalAlpha = 1;
+
+  // Condição
+  ctx.font = 'bold 16px Sans';
+  ctx.fillText(conditionLabel, 36, 185);
+
+  // Humidade / vento
+  ctx.font = '13px Sans';
+  ctx.globalAlpha = 0.9;
+  ctx.fillText(`Humidade: ${humidity}%  ·  Vento: ${Math.round(windKmh)} km/h`, 36, 215);
+  ctx.globalAlpha = 1;
+
+  return canvas.toBuffer('image/png');
 }
 
 async function getWeatherImpl(city) {
@@ -253,21 +267,13 @@ async function getWeatherImpl(city) {
     };
     const code = wData.current.weather_code;
     const label = weatherLabels[code] || 'Condição desconhecida';
-    const cardHtml = `<div style="display:flex; flex-direction:column; width:100%; height:100%; padding:36px; background:linear-gradient(135deg,#4F46E5,#0EA5E9); font-family:Inter; color:white;">
-      <div style="display:flex; font-size:20px; font-weight:700;">${escapeHtml(loc.name)}</div>
-      <div style="display:flex; align-items:flex-end;">
-        <div style="display:flex; font-size:64px; font-weight:700; padding-top:14px;">${Math.round(wData.current.temperature_2m)}°</div>
-        <div style="display:flex; font-size:20px; padding:0 0 14px 10px; opacity:0.85;">C</div>
-      </div>
-      <div style="display:flex; font-size:16px; font-weight:600;">${escapeHtml(label)}</div>
-      <div style="display:flex; font-size:13px; padding-top:14px; opacity:0.9;">Humidade: ${wData.current.relative_humidity_2m}%  ·  Vento: ${Math.round(wData.current.wind_speed_10m)} km/h</div>
-    </div>`;
+
     let cardImage = null;
     try {
-      const svg = await htmlToSvgViaSatori(cardHtml, 420, 280);
-      const buffer = await svgToPngBuffer(svg);
+      const buffer = drawWeatherCard(loc.name, wData.current.temperature_2m, label, wData.current.relative_humidity_2m, wData.current.wind_speed_10m);
       cardImage = buffer.toString('base64');
     } catch (_) {}
+
     return {
       found: true, city: loc.name, temperature_c: wData.current.temperature_2m, condition: label,
       humidity_percent: wData.current.relative_humidity_2m, wind_kmh: wData.current.wind_speed_10m,
@@ -286,7 +292,5 @@ module.exports = {
   searchBooksImpl,
   downloadImageForProjectImpl,
   searchMarketImpl,
-  searchPlaceImpl,
-  searchCalendarDateImpl,
   getWeatherImpl,
 };
