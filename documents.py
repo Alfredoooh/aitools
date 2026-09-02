@@ -1216,6 +1216,7 @@ def _add_grafico_slide(slide, chart_spec, left_in=0.8, top_in=1.9, width_in=8.4,
         "area": XL_CHART_TYPE.AREA,
     }
     xl_tipo = tipo_map.get(chart_spec.get("type", "bar"), XL_CHART_TYPE.COLUMN_CLUSTERED)
+    tipo = chart_spec.get("type", "bar")
 
     chart_data = CategoryChartData()
     chart_data.categories = chart_spec.get("labels", [])
@@ -1239,10 +1240,15 @@ def _add_grafico_slide(slide, chart_spec, left_in=0.8, top_in=1.9, width_in=8.4,
     cores = chart_spec.get("colors") or PALETA
     try:
         plot = chart.plots[0]
-        for i, ponto_serie in enumerate(plot.series):
-            cor = cores[i % len(cores)]
-            ponto_serie.format.fill.solid()
-            ponto_serie.format.fill.fore_color.rgb = _cor_pptx(cor)
+        if tipo in ("pie", "doughnut"):
+            for i, ponto in enumerate(plot.series[0].points):
+                ponto.format.fill.solid()
+                ponto.format.fill.fore_color.rgb = _cor_pptx(cores[i % len(cores)])
+        else:
+            for i, ponto_serie in enumerate(plot.series):
+                cor = cores[i % len(cores)]
+                ponto_serie.format.fill.solid()
+                ponto_serie.format.fill.fore_color.rgb = _cor_pptx(cor)
     except Exception:
         pass
 
