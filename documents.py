@@ -366,7 +366,7 @@ def montar_qrcode(spec):
     w_original = b[2] - b[0]
     h_original = b[3] - b[1]
     drawing = Drawing(largura, largura, transform=[largura / w_original, 0, 0, largura / h_original, 0, 0])
-    drawing.add(widget)
+    drawing.add(widget.draw())
     return drawing
 
 
